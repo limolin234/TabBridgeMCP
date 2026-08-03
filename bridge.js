@@ -10,28 +10,63 @@ const { randomUUID } = require('node:crypto');
 const host = '127.0.0.1';
 const port = Number(process.env.TPMONKEY_MCP_PORT || 18475);
 const maxJobs = 100;
-// Single-instance lock: a shared bridge must serve every MCP process. Atomic
-// mkdir (not a pidfile write) so a second instance can detect a live owner
-// and hand off instead of failing on a stale port. Two-nodefs fallbacks keep
-// the bridge usable in single-MCP setups.
+// Single-instance lock: a shared bridge must serve every MCP process. Non-
+// recursive mkdir is the atomic primitive (a second mkdir fails with EEXIST
+// while the lock dir exists), and the pid inside lets us reclaim stale locks.
+// Only the process whose own pid is in the lock may consider itself the owner.
 function acquireLock() {
   const lockDir = path.join(os.tmpdir(), 'tabbridge-mcp.lock');
+  let mine = false;
   try {
-    fs.mkdirSync(lockDir, { recursive: true });
+    fs.mkdirSync(lockDir);
+    mine = true; // we just created the lock dir
   } catch (error) {
     if (error.code === 'EEXIST') {
-      try { const existing = Number.parseInt(fs.readFileSync(path.join(lockDir, 'pid'), 'utf8'), 10); if (Number.isInteger(existing) && existing > 0 && fs.kill(existing, 0)) return 'handoff'; } catch (e) { /* stale lock */ }
-      try { fs.rmSync(lockDir, { recursive: true, force: true }); fs.mkdirSync(lockDir, { recursive: true }); } catch (e) { /* raced */ }
-    } else { return 'nodir'; }
+      // Read the pid. If it names a live process, the lock is owned. If the
+      // owner is dead or the pid is unreadable, reclaim the stale lock.
+      let ownerAlive = false;
+      try {
+        const existing = Number.parseInt(fs.readFileSync(path.join(lockDir, 'pid'), 'utf8'), 10);
+        ownerAlive = Number.isInteger(existing) && existing > 0 && fs.kill(existing, 0);
+      } catch (e) { /* no pid or unreadable: treat as stale */ }
+      if (ownerAlive) return { owner: 'handoff' };
+      try {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+        fs.mkdirSync(lockDir);
+        mine = true;
+      } catch (e) {
+        // Someone else reclaimed the lock while we were removing it.
+        if (e.code === 'EEXIST') return { owner: 'handoff' };
+        return { owner: 'nodir' };
+      }
+    } else {
+      return { owner: 'nodir' };
+    }
   }
-  try { fs.writeFileSync(path.join(lockDir, 'pid'), `${process.pid}\n`, { mode: 0o600 }); return 'acquired'; } catch (e) { return 'nopid'; }
+  try { fs.writeFileSync(path.join(lockDir, 'pid'), `${process.pid}\n`, { mode: 0o600 }); return { owner: 'acquired', mine }; } catch (e) { return { owner: 'nopid', mine }; }
+}
+
+// Remove the lock only if it is still ours (compare pid) so we never tear
+// down a bridge that replaced us.
+function releaseLock() {
+  try {
+    const lockDir = path.join(os.tmpdir(), 'tabbridge-mcp.lock');
+    const existing = Number.parseInt(fs.readFileSync(path.join(lockDir, 'pid'), 'utf8'), 10);
+    if (existing === process.pid) fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch (e) { /* already gone */ }
 }
 
 const lock = acquireLock();
-if (lock === 'handoff') {
+if (lock.owner === 'handoff') {
   process.stderr.write('TabBridge: another instance holds the lock; handing off.\n');
   process.exit(0);
 }
+
+// Release the lock on clean exit (EADDRINUSE self-exit, SIGINT, etc.) so a
+// later bridge is not treated as a stale lock.
+process.on('exit', releaseLock);
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
 
 let state = { jobs: [], clients: {} };
 
@@ -143,6 +178,9 @@ const server = http.createServer(async (request, response) => {
 const listen = server.listen(port, host, () => process.stdout.write(`TabBridge listening on http://${host}:${port}\n`));
 listen.on('error', (error) => {
   if (error.code === 'EADDRINUSE') {
+    // The port is already held by the shared bridge (possibly a concurrent
+    // instance that won the lock race). Hand off cleanly; releaseLock runs on
+    // exit and will not delete a lock owned by another pid.
     process.stderr.write(`TabBridge: port ${port} already in use by another instance; exiting.\n`);
     process.exit(0);
   }
