@@ -7,10 +7,11 @@ const { spawn } = require('node:child_process');
 const adapters = require('./adapters');
 
 const port = Number(process.env.TPMONKEY_MCP_PORT || 18475);
-const timeoutMs = Number(process.env.TPMONKEY_MCP_TIMEOUT_MS || 30000);
+const defaultTimeoutMs = Number(process.env.TPMONKEY_MCP_TIMEOUT_MS || 30000);
+const tabHeartbeatMs = 60000;
 let bridgeChild = null;
 
-function request(method, pathname, body) {
+function request(method, pathname, body, timeoutMs = defaultTimeoutMs) {
   return new Promise((resolve, reject) => {
     const raw = body === undefined ? null : JSON.stringify(body);
     const client = http.request({ hostname: '127.0.0.1', port, path: pathname, method, headers: raw ? {
@@ -35,15 +36,22 @@ function request(method, pathname, body) {
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+// Spawn one shared bridge for this machine, never a private copy per MCP
+// process. The bridge self-exits with code 0 when another instance already
+// owns the port, so every mcp-server converges on the same single instance.
 async function ensureBridge() {
-  try { await request('GET', '/health'); return; } catch { /* Start a bridge for this MCP process. */ }
+  try { await request('GET', '/health', undefined, 2000); return; } catch { /* Start a bridge for this MCP process. */ }
   if (!bridgeChild || bridgeChild.exitCode !== null) {
-    bridgeChild = spawn(process.execPath, [path.join(__dirname, 'bridge.js')], { stdio: 'ignore', env: process.env });
+    bridgeChild = spawn(process.execPath, [path.join(__dirname, 'bridge.js')], {
+      stdio: 'ignore',
+      env: process.env,
+      detached: true,
+    });
     bridgeChild.unref();
   }
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await wait(100);
-    try { await request('GET', '/health'); return; } catch { /* Retry while the bridge binds. */ }
+    try { await request('GET', '/health', undefined, 2000); return; } catch { /* Retry while the bridge binds. */ }
   }
   throw new Error('Could not start the local browser bridge');
 }
@@ -51,24 +59,36 @@ async function ensureBridge() {
 async function tabs() {
   await ensureBridge();
   const response = await request('GET', '/jobs');
-  return Object.entries(response.clients).map(([id, client]) => ({ id, ...client }));
+  const cutoff = Date.now() - tabHeartbeatMs;
+  return Object.entries(response.clients)
+    .filter(([, client]) => Date.parse(client.lastSeenAt) >= cutoff)
+    .map(([id, client]) => ({ id, ...client }));
 }
+
+// Operations that involve a full page load need longer than a quick extract.
+const timeoutFor = (type) => (type === 'navigate' || type === 'download'
+  ? Number(process.env.TPMONKEY_MCP_NAV_TIMEOUT_MS || 60000)
+  : defaultTimeoutMs);
 
 async function enqueue(type, payload) {
   await ensureBridge();
   if (!payload.tabId) throw new Error('tabId is required. Call browser_tabs first and choose the dedicated tab.');
   const queued = await request('POST', '/jobs', { type, payload, target: payload.tabId });
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + timeoutFor(type);
+  let lastStatus = 'queued';
   while (Date.now() < deadline) {
     await wait(250);
-    const response = await request('GET', '/jobs');
+    let response;
+    try { response = await request('GET', '/jobs'); } catch { continue; } // bridge restarting; keep polling
     const job = response.jobs.find((item) => item.id === queued.job.id);
-    if (job && ['completed', 'blocked', 'error'].includes(job.status)) {
+    if (!job) continue; // rotated out of the in-memory tail; treat as lost
+    lastStatus = job.status;
+    if (['completed', 'blocked', 'error'].includes(job.status)) {
       if (job.status === 'error') throw new Error(job.error || 'Browser action failed');
       return job;
     }
   }
-  throw new Error('Browser tab did not complete the action within 30 seconds');
+  throw new Error(`Browser tab did not complete the action within ${timeoutFor(type) / 1000}s (job ${queued.job.id}, last status: ${lastStatus})`);
 }
 
 const tools = [
@@ -120,4 +140,6 @@ process.stdin.on('data', async (chunk) => {
     } else send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });
   }
 });
-process.on('exit', () => bridgeChild?.kill());
+// The bridge is a shared, machine-wide single instance; an mcp-server must NOT
+// kill it on exit, or one session would tear down the browser connection of all
+// the others. Let it keep running until the machine reboots or it is re-spawned.

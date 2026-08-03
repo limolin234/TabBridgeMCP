@@ -28,9 +28,12 @@ command = "node"
 args = ["/absolute/path/to/tabbridge-mcp/mcp-server.js"]
 ```
 
-3. Restart the MCP client. The MCP server starts and owns its local bridge on
-   demand, then closes it when the MCP process exits. No separate daemon,
-   service manager, browser launch, or profile setup is required.
+3. Restart the MCP client. The MCP server starts a machine-wide local bridge
+   on demand. The bridge is a single shared instance (single-process lock on a
+   temp directory + port): when multiple MCP processes run concurrently, they
+   all converge on the same bridge and hand off instead of spawning private
+   copies. No separate daemon, service manager, browser launch, or profile
+   setup is required.
 
 ## Dedicated-tab workflow
 
@@ -46,6 +49,12 @@ interaction yourself, then let the agent continue with the same `tabId`.
   fixed protocol, not a site-specific extension collection.
 - **Keep ownership local:** no profile copy, remote display, cookie export, or
   browser daemon. The bridge listens only on `127.0.0.1:18475`.
+- **Keep state disposable:** the bridge queue lives only in memory. A bridge
+  restart drops unfinished work, and the MCP caller can safely submit it again.
+- **Share one bridge across processes:** every MCP process talks to the same
+  local bridge. Jobs are claimed per browser tab, so concurrent agents working
+  on distinct tabs run in parallel; tasks claimed by a tab that stopped
+  polling are returned to the queue so they are not lost.
 - **Spend context deliberately:** adapters request small structured fields by
   default; bounded text or HTML is an explicit debugging fallback.
 - **Extend server-side:** add or replace adapters without asking users to

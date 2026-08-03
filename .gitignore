@@ -1,2 +1,1 @@
-state.json
-*.tmp
+# The bridge queue is intentionally in-memory.
