@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.10
+// @version      0.7.13
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      127.0.0.1
 // @noframes
 // ==/UserScript==
@@ -26,13 +29,20 @@
   const storedTabState = readTabState();
   const legacyClientId = sessionStorage.getItem('tm-browser-mcp-client');
   const clientId = storedTabState?.clientId || legacyClientId || crypto.randomUUID();
-  // enabled is PER-TAB and defaults to off. It is recovered from window.name
-  // (which survives cross-origin navigation in the same tab) with
-  // sessionStorage as a same-origin fallback. A NEW tab has no window.name and
-  // no sessionStorage entry, so it starts off — the GM-setValue experiment
-  // (v0.7.6) wrongly made every new tab enabled because GM storage is global,
-  // not per-tab.
-  let enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  // enabled is PER-TAB, recovered from window.name (survives cross-origin
+  // navigation) with sessionStorage as a same-origin fallback. A NEW tab that
+  // has neither uses a global DEFAULT preference (GM storage) — default on, so
+  // a fresh tab is immediately usable without clicking the toggle. Manually
+  // toggling a tab writes window.name/sessionStorage and overrides the default
+  // for that tab.
+  let enabled;
+  if (storedTabState) {
+    enabled = storedTabState.enabled === true;
+  } else if (sessionStorage.getItem('tm-browser-mcp-enabled') != null) {
+    enabled = sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  } else {
+    enabled = defaultEnabledPref(); // GM-stored default for brand-new tabs (on by default)
+  }
   let tabState = { ...(storedTabState || {}), clientId, enabled };
   function updateTabState(patch) {
     tabState = { ...tabState, ...patch };
@@ -41,30 +51,39 @@
   updateTabState({ clientId, enabled });
   let busy = false;
 
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.style.cssText = 'position:fixed;z-index:2147483647;right:12px;bottom:12px;padding:6px 9px;border:1px solid #777;border-radius:4px;background:#fff;color:#222;font:12px sans-serif;cursor:pointer;box-shadow:0 1px 3px #777';
-  function mountButton() {
-    if (document.body && !button.isConnected) document.body.append(button);
-  }
-  function paint(note = '') {
-    mountButton();
-    button.textContent = `Browser MCP: ${enabled ? (busy ? 'working' : 'ready') : 'off'}${note ? ` (${note})` : ''}`;
-    button.style.background = enabled ? '#e7f4ea' : '#f5f5f5';
-  }
-  button.addEventListener('click', () => {
-    enabled = !enabled;
+  // No floating button: per-tab state is controlled entirely through the
+  // Tampermonkey menu (GM_registerMenuCommand). This keeps the page untouched
+  // and avoids any overlay/click issues.
+  function paint(/* note = '' */) { /* state shown via menu label only */ }
+  function setEnabled(value) {
+    enabled = value;
     sessionStorage.setItem('tm-browser-mcp-enabled', String(enabled));
     updateTabState({ enabled });
     paint();
-    // Kick the poll loop immediately so an enable takes effect now, not at the
-    // next idle tick (up to 1200ms later). Without this, clicking the button on
-    // a fresh tab felt like "no reaction" because polling stayed idle.
     if (enabled) schedulePoll();
-  });
-  mountButton();
-  document.addEventListener('DOMContentLoaded', mountButton, { once: true });
-  GM_registerMenuCommand('Toggle Browser MCP for this tab', () => button.click());
+  }
+  // Menu command shows the live per-tab state and toggles it. Re-register
+  // after each toggle so the label always reflects the current state.
+  let menuCmdId = null;
+  let menuDefaultId = null;
+  function defaultEnabledPref() {
+    try { return typeof GM_getValue === 'function' ? GM_getValue('tm-browser-mcp-default-enabled', true) !== false : true; } catch { return true; }
+  }
+  function registerMenu() {
+    if (typeof GM_unregisterMenuCommand === 'function') {
+      if (menuCmdId != null) { try { GM_unregisterMenuCommand(menuCmdId); } catch { /* ignore */ } }
+      if (menuDefaultId != null) { try { GM_unregisterMenuCommand(menuDefaultId); } catch { /* ignore */ } }
+    }
+    const label = `Browser MCP for this tab: ${enabled ? 'ON' : 'OFF'} (click to toggle)`;
+    menuCmdId = GM_registerMenuCommand(label, () => { setEnabled(!enabled); registerMenu(); });
+    const defOn = defaultEnabledPref();
+    menuDefaultId = GM_registerMenuCommand(`Default for new tabs: ${defOn ? 'ON' : 'OFF'} (click to switch)`, () => {
+      const next = !defaultEnabledPref();
+      try { if (typeof GM_setValue === 'function') GM_setValue('tm-browser-mcp-default-enabled', next); } catch { /* ignore */ }
+      registerMenu();
+    });
+  }
+  registerMenu();
   paint();
 
   function api(method, pathname, data) {
@@ -425,7 +444,6 @@
     if (polling) return; // re-entry guard
     polling = true;
     try {
-      mountButton();
       if (!enabled) { pollDelay = 1200; return; }
       let response;
       try { response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy }); }
