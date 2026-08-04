@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.4
+// @version      0.7.5
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -425,4 +425,12 @@
     if (enabled && active?.job) run(active.job, active.phase);
     else poll();
   }, 500);
+  // Robustness: when the tab becomes visible again or is restored from the
+  // back/forward cache, resume polling immediately instead of waiting for the
+  // next idle tick — recovers from page-level stalls (heavy SPA re-renders,
+  // cookie/consent overlays) without a manual refresh.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) poll();
+  });
+  window.addEventListener('pageshow', poll);
 })();
