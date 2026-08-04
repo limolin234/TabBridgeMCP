@@ -129,6 +129,40 @@ function isSpecial(el) {
   return { isSpecial: hints.length > 0, hints };
 }
 
+// ---- Noise detection ------------------------------------------------------
+// Consent/cookie overlays, modal close buttons, and accessibility widgets are
+// NOT what a user is looking at — promoting them to primary wastes the AI's
+// attention and forces extra queries to reach the real content. Detect them
+// from static facts (id/class/aria/role/text) and demote to hidden.
+
+const NOISE_SELECTOR = [
+  'CybotCookiebotDialog',       // Cookiebot — trademark token, no word boundary
+  'osano-cm',                  // Osano consent
+  'onetrust',                  // OneTrust consent
+].join('|');
+const NOISE_TOKEN_RE = new RegExp(NOISE_SELECTOR, 'i');
+const NOISE_WORD_RE = new RegExp(`(^|[^a-z])(cookie|consent|gdpr|modal|dialog|popover|close-modal|bp-modal|visually-hidden|sr-only|skip-link|cookie-banner)([^a-z]|$)`, 'i');
+const NOISE_TEXT_RE = /(allow all cookies|accept all cookies|use necessary cookies|manage consent|cookie settings|consent|cookie preferences|privacy settings)/i;
+const NOISE_CLOSE_RE = /^[×x✕✖]|close( modal| dialog| menu)?$/i;
+
+function isNoise(item) {
+  if (!item) return false;
+  const id = String(item.id || '');
+  const cls = (item.path && item.path[0] && item.path[0].class ? item.path[0].class : []).join(' ');
+  const role = String(item.role || '').toLowerCase();
+  const text = String(item.text || '');
+  const aria = String(item.ariaLabel || '');
+  // 1. consent/cookie banner controls by id/class/role/text
+  if (NOISE_TOKEN_RE.test(id) || NOISE_TOKEN_RE.test(cls) || NOISE_WORD_RE.test(id) || NOISE_WORD_RE.test(cls) || NOISE_TEXT_RE.test(text) || NOISE_TEXT_RE.test(aria)) return true;
+  if (role === 'dialog' || role === 'alertdialog') return true;
+  // 2. modal chrome: close buttons / hidden labels
+  if (NOISE_CLOSE_RE.test(text) && item.kind !== 'link') return true;
+  if (/^close/i.test(aria) && /modal|dialog|popup/i.test(aria)) return true;
+  // 3. accessibility-only widgets
+  if (/skip to (main )?content|跳转到主要/i.test(text) || /^main navigation/i.test(aria)) return true;
+  return false;
+}
+
 // Human-salience score 0..100 from physical facts only.
 // size (log-scaled area through a sigmoid so mid-sized controls beat giant
 //   container blocks), position (F-pattern: top-left strongest), kind,
@@ -146,8 +180,14 @@ function salience(item, viewport) {
   const position = 1 - (normY + 0.5 * normX);
   const kind = KIND_WEIGHT[item.kind] ?? 0.3;
   const special = item.special ? 1 : 0;
-  const textness = Math.min(0.05 * Math.log1p(String(item.text || '').trim().length), 1);
-  let score = 100 * (0.30 * size + 0.30 * position + 0.20 * kind + 0.20 * special + 0.10 * textness);
+  // Text readability is the dominant signal WITHOUT a vision model: a button
+  // or link the AI can read (author name, "Download PDF", a post title) is
+  // worth far more than a large-but-mute icon or a checkbox whose text is "on".
+  const text = String(item.text || '').trim();
+  const label = String(item.ariaLabel || '').trim();
+  const meaningful = (text && !/^(on|off|true|false|×|x)$/i.test(text) && text.length >= 2) || (label && label.length >= 4);
+  const textness = meaningful ? Math.min(0.08 * Math.log1p(Math.max(text.length, label.length)), 1) : 0;
+  let score = 100 * (0.22 * size + 0.18 * position + 0.18 * kind + 0.14 * special + 0.28 * textness);
   if (!item.inViewport) score = Math.min(score, 5); // off-screen never primary
   return Math.round(score);
 }
@@ -396,6 +436,16 @@ function assignZones(items, options = {}) {
   const visible = items.filter((it) => it.inViewport);
   const offscreen = items.filter((it) => !it.inViewport);
 
+  // Consent/modal noise is demoted to hidden outright — even if it has
+  // readable text ("Allow all cookies"), it is not what the user is trying to
+  // reach, and listing it in primary/secondary wastes the AI's attention.
+  const noise = [...visible, ...offscreen].filter((it) => it._noise).slice(0, 15);
+  for (const it of noise) {
+    hidden.push({ kind: it.kind || it.tag, selector: it.selector, reason: 'noise' });
+  }
+  const visibleMain = visible.filter((it) => !it._noise);
+  const offscreenMain = offscreen.filter((it) => !it._noise);
+
   // Group FIRST: similar in-viewport elements (hot-search rows, nav clusters)
   // merge into groups before primary is chosen, so a row of 12 hot-links never
   // floods the primary zone. Marked-unimportant elements never seed a group.
@@ -420,11 +470,17 @@ function assignZones(items, options = {}) {
   // primary: from NON-grouped visible elements only — adaptive top-k plus
   // hard-promote form controls / special actions. Cap at 8 so the AI sees a
   // short list of the salient actions, not a crowded row. Marked-unimportant
-  // elements are excluded from promotion.
-  const ungroupedVis = visible.filter((it) => !groupedMemberKeys.has(it._k) && !(it.pref && it.pref.unimportant));
+  // and consent/modal NOISE elements are excluded — a cookie banner must not
+  // claim the top of the list.
+  const ungroupedVis = visible.filter((it) => !groupedMemberKeys.has(it._k) && !(it.pref && it.pref.unimportant) && !it._noise);
   const k = Math.max(3, Math.min(8, Math.floor(ungroupedVis.length / 4)));
   const sortedUngrouped = [...ungroupedVis].sort((a, b) => b.score - a.score);
-  const promoted = sortedUngrouped.filter((it) => it.special || ['input', 'textarea', 'select'].includes(it.kind)).slice(0, 12);
+  // Hard-promote only form controls that carry READABLE text (a labelled
+  // search box, a submit button with "Download PDF"). A mute checkbox whose
+  // text is "on" is not something the AI can act on, so it must not be pushed
+  // into primary by kind alone.
+  const meaningful = (it) => String(it.text || '').trim().length >= 2 && !/^(on|off|true|false)$/i.test(String(it.text || '').trim());
+  const promoted = sortedUngrouped.filter((it) => (it.special || ['input', 'textarea', 'select'].includes(it.kind)) && (meaningful(it) || String(it.ariaLabel || '').length >= 4)).slice(0, 12);
   const promotedKeys = new Set(promoted.map((it) => it._k));
   const topK = sortedUngrouped.filter((it) => !promotedKeys.has(it._k)).slice(0, k);
   primary.push(...[...promoted, ...topK].slice(0, 8));
@@ -441,8 +497,8 @@ function assignZones(items, options = {}) {
 
   // secondary = visible not primary not grouped-member, then off-screen.
   secondary.push(
-    ...visible.filter((it) => !primaryKeys.has(it._k) && !groupedMemberKeys.has(it._k)).sort((a, b) => b.score - a.score).slice(0, limit),
-    ...offscreen.sort((a, b) => b.score - a.score).slice(0, Math.max(0, limit - visible.length)),
+    ...visibleMain.filter((it) => !primaryKeys.has(it._k) && !groupedMemberKeys.has(it._k)).sort((a, b) => b.score - a.score).slice(0, limit),
+    ...offscreenMain.sort((a, b) => b.score - a.score).slice(0, Math.max(0, limit - visibleMain.length)),
   );
 
   return { primary, secondary, grouped: groupedMeta, hidden };
@@ -487,6 +543,7 @@ function analyzeInteract(raw, options = {}) {
       selector: selectorFromPath(el.path),
       path: el.path,
       special: special.isSpecial,
+      _noise: isNoise({ id: el.id, path: el.path, role: el.role, text: el.text, ariaLabel: el['aria-label'], kind }),
       _hidden: !vis,
     };
     item.score = salience(item, viewport);
