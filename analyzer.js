@@ -448,8 +448,9 @@ function assignZones(items, options = {}) {
 
   // Group FIRST: similar in-viewport elements (hot-search rows, nav clusters)
   // merge into groups before primary is chosen, so a row of 12 hot-links never
-  // floods the primary zone. Marked-unimportant elements never seed a group.
-  const groupable = visible.filter((it) => groupKeyFor(it) !== null && !(it.pref && it.pref.unimportant));
+  // floods the primary zone. Marked-unimportant and NOISE elements never seed a
+  // group — a cluster of cookie-banner buttons must not become a "group".
+  const groupable = visibleMain.filter((it) => groupKeyFor(it) !== null && !(it.pref && it.pref.unimportant));
   const grouped = buildGroups(groupable.map((it) => ({ ...it })), options.viewport);
   const groupedMemberKeys = new Set();
   for (const g of grouped) {
