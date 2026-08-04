@@ -5,6 +5,13 @@ const http = require('node:http');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const adapters = require('./adapters');
+const { interactPlan, analyzeInteract, verifyItem, buildCuesFromItem } = require('./analyzer');
+const memory = require('./memory');
+
+// Per-tab interact snapshots: { url, capturedAt, items }. The userscript is
+// frozen; this server-side cache is how we resolve an index to a stable
+// selector / point at action time.
+const snapshots = new Map();
 
 const port = Number(process.env.TPMONKEY_MCP_PORT || 18475);
 const defaultTimeoutMs = Number(process.env.TPMONKEY_MCP_TIMEOUT_MS || 30000);
@@ -79,7 +86,7 @@ async function enqueue(type, payload) {
   const deadline = Date.now() + timeoutFor(type);
   let lastStatus = 'queued';
   while (Date.now() < deadline) {
-    await wait(250);
+    await wait(100);
     let response;
     try { response = await request('GET', '/jobs'); } catch { continue; } // bridge restarting; keep polling
     const job = response.jobs.find((item) => item.id === queued.job.id);
@@ -100,6 +107,103 @@ async function enqueueBackground(type, payload) {
   return queued.job;
 }
 
+// --- Interact snapshot resolution -----------------------------------------
+
+function snapshotFor(tabId) {
+  const snapshot = snapshots.get(tabId);
+  if (!snapshot) throw new Error('No interact snapshot. Call browser_read with mode "interact" first.');
+  return snapshot;
+}
+function itemFor(tab, args) {
+  const snapshot = snapshotFor(args.tabId);
+  if (tab.url !== snapshot.url) throw new Error('Page changed since the interact snapshot; re-read interact.');
+  if (args.index === undefined) throw new Error('index is required');
+  const item = snapshot.items[args.index];
+  if (!item) throw new Error(`No interact element at index ${args.index} (snapshot has ${snapshot.items.length}). Re-read interact.`);
+  return item;
+}
+// Binding guard: before acting, confirm the point still hosts the recorded
+// object. Off-screen targets cannot be verified (elementFromPoint misses them)
+// so they skip the guard and rely on the URL check + selector click.
+async function verifyBinding(tab, args, item) {
+  if (!item || !item.inViewport || !item.point) return true;
+  const job = await enqueue('verifyPoint', { tabId: args.tabId, x: item.point.x, y: item.point.y });
+  const found = job.result && job.result.found;
+  const verdict = verifyItem(item, found);
+  if (!verdict.ok) throw new Error(verdict.reason);
+  return true;
+}
+
+async function dispatchAction(tab, args) {
+  const action = args.action;
+  const base = { tabId: args.tabId };
+  if (action === 'navigate') return enqueue('navigate', args);
+  if (action === 'fill') {
+    if (args.index !== undefined) return enqueue('fill', { ...base, selector: itemFor(tab, args).selector, value: args.value });
+    if (args.selector) return enqueue('fill', args);
+    throw new Error('fill requires index or selector');
+  }
+  if (action === 'click') {
+    if (args.index !== undefined) {
+      const item = itemFor(tab, args);
+      await verifyBinding(tab, args, item);
+      // Prefer point-click for in-viewport targets: the point is what
+      // verifyPoint validated, so it can never be a wrong identical-class
+      // sibling that a short CSS selector would match. Off-screen targets
+      // have no reliable point, so scroll into view and click by selector.
+      let job;
+      if (item.inViewport && item.point) job = await enqueue('clickPoint', { ...base, x: item.point.x, y: item.point.y });
+      else if (item.selector) {
+        if (!item.inViewport) await enqueue('scroll', { ...base, selector: item.selector });
+        job = await enqueue('click', { ...base, selector: item.selector });
+      } else {
+        throw new Error(`Element ${args.index} is off-screen and has no selector; scroll it into view then re-read.`);
+      }
+      // Only completed clicks are remembered (a blocked state or a verify
+      // failure throws before this point) — the "wrong path" guard.
+      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), buildCuesFromItem(item));
+      return job;
+    }
+    if (args.point) {
+      const job = await enqueue('clickPoint', { ...base, x: args.point.x, y: args.point.y });
+      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: null });
+      return job;
+    }
+    if (args.x !== undefined && args.y !== undefined) return enqueue('clickPoint', { ...base, x: args.x, y: args.y });
+    if (args.selector) {
+      const job = await enqueue('click', args);
+      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: args.selector });
+      return job;
+    }
+    throw new Error('click requires index, point{x,y}, x/y, or selector');
+  }
+  if (action === 'scroll') {
+    if (args.index !== undefined) return enqueue('scroll', { ...base, selector: itemFor(tab, args).selector });
+    if (args.selector) return enqueue('scroll', args);
+    if (args.dx !== undefined || args.dy !== undefined) return enqueue('scroll', { ...base, dx: args.dx || 0, dy: args.dy || 0 });
+    if (args.x !== undefined || args.y !== undefined) return enqueue('scroll', { ...base, x: args.x || 0, y: args.y || 0 });
+    throw new Error('scroll requires index, selector, dx/dy, or x/y');
+  }
+  if (action === 'focus' || action === 'hover') {
+    if (args.index !== undefined) return enqueue(action, { ...base, selector: itemFor(tab, args).selector });
+    if (args.selector) return enqueue(action, args);
+    throw new Error(`${action} requires index or selector`);
+  }
+  if (action === 'key') {
+    if (!args.key) throw new Error('key requires a key value');
+    return enqueue('key', args);
+  }
+  if (action === 'clickPoint') {
+    if (args.x === undefined || args.y === undefined) throw new Error('clickPoint requires x and y');
+    return enqueue('clickPoint', args);
+  }
+  if (action === 'verifyPoint') {
+    if (args.x === undefined || args.y === undefined) throw new Error('verifyPoint requires x and y');
+    return enqueue('verifyPoint', args);
+  }
+  throw new Error(`unknown action ${action}`);
+}
+
 async function jobStatus(jobId) {
   await ensureBridge();
   const response = await request('GET', '/jobs');
@@ -109,16 +213,17 @@ async function jobStatus(jobId) {
 }
 
 function compactJob(job, extra = {}) {
-  return { jobId: job.id, status: job.status, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...extra };
+  return { jobId: job.id, status: job.status, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...(job.progress ? { progress: job.progress } : {}), ...extra };
 }
 
 const tools = [
   { name: 'browser_tabs', description: 'List explicitly enabled dedicated browser tabs.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'browser_read', description: 'Read a cleaned, layered view of one tab. Use inspect only when this is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['summary', 'text', 'elements', 'links', 'controls', 'media'] }, selector: { type: 'string' }, contains: { type: 'string' }, visible: { type: 'boolean' }, limit: { type: 'number' }, offset: { type: 'number' } }, required: ['tabId'] } },
-  { name: 'browser_action', description: 'Navigate, click, or fill one dedicated tab.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['navigate', 'click', 'fill'] }, url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' } }, required: ['tabId', 'action'] } },
-  { name: 'browser_download', description: 'Start a browser download job. Returns immediately with a jobId; use browser_job_status to monitor progress.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_read', description: 'Read a cleaned, layered view of one tab. Use inspect only when this is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['summary', 'text', 'elements', 'links', 'controls', 'media', 'interact'] }, selector: { type: 'string' }, contains: { type: 'string' }, visible: { type: 'boolean' }, limit: { type: 'number' }, offset: { type: 'number' }, expand: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_action', description: 'Navigate, click, or fill a selected tab. Interact modes also accept index/point/x/y/dx/dy/key.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['navigate', 'click', 'fill', 'scroll', 'focus', 'hover', 'key', 'clickPoint', 'verifyPoint'] }, url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' }, index: { type: 'number' }, point: { type: 'object' }, x: { type: 'number' }, y: { type: 'number' }, dx: { type: 'number' }, dy: { type: 'number' }, key: { type: 'string' }, code: { type: 'string' } }, required: ['tabId', 'action'] } },
+  { name: 'browser_download', description: 'Download a file. Browsers preview PDFs inline by default, so downloads default to a forced save (bypasses the inline viewer) unless preview:true opts into the browser inline view. Returns immediately with a jobId; use browser_job_status to monitor progress.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, preview: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
   { name: 'browser_job_status', description: 'Get status and byte progress for a background browser job.', inputSchema: { type: 'object', properties: { jobId: { type: 'string' } }, required: ['jobId'] } },
   { name: 'browser_inspect', description: 'Debug-only bounded fallback. Request limited plain text or HTML only when browser_read is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['text', 'html'] }, limit: { type: 'number' } }, required: ['tabId'] } },
+  { name: 'browser_mark', description: 'Mark an interact element important/unimportant for the current page domain (site memory), or list/clear current marks. index = position from the latest browser_read interact snapshot; selector is the offline-capable alternative.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['important', 'unimportant', 'list', 'clear'] }, index: { type: 'number' }, selector: { type: 'string' } }, required: ['tabId', 'action'] } },
 ];
 
 async function callTool(name, args = {}) {
@@ -126,14 +231,78 @@ async function callTool(name, args = {}) {
   if (name === 'browser_read') {
     const tab = (await tabs()).find((item) => item.id === args.tabId);
     if (!tab) throw new Error('Unknown tabId. Call browser_tabs again.');
-    const adapter = adapters.forUrl(tab.url);
     const options = { mode: args.mode || 'summary', selector: args.selector, contains: args.contains, visible: args.visible, limit: args.limit, offset: args.offset };
+    if (options.mode === 'interact') {
+      // Interact is a structural capability, not site content — it deliberately
+      // bypasses URL adapters and uses the local analyzer. Always harvest a
+      // generous candidate set (250) regardless of the caller's limit — many
+      // pages lead with hidden elements (dropdowns, ARIA utilities) that the
+      // analyzer filters, so a small harvest limit would collapse to 0 results.
+      // The caller's limit only trims the analyzed output, not the harvest.
+      // expand a previously-seen group from the stored harvest, no new extract
+      if (args.expand) {
+        const snapshot = snapshots.get(args.tabId);
+        if (!snapshot) throw new Error('No interact snapshot. Call browser_read with mode "interact" first.');
+        if (snapshot.url !== tab.url) throw new Error('Page changed since the interact snapshot; re-read interact.');
+        const expanded = analyzeInteract(snapshot.raw, { expand: args.expand, limit: args.limit, viewport: snapshot.viewport, preference: snapshot.preference });
+        return { adapter: 'interact', zone: 'grouped', ...expanded };
+      }
+      // Harvest only the interact field (skip the heavier structure field) and
+      // cap the harvest: on dense pages (reddit) 250 candidates x 15 properties
+      // can make the userscript stall and drop the /result — which surfaces as
+      // "Bridge is not running". 120 candidates is plenty for attention zones.
+      const plan = interactPlan(options);
+      plan.fields = plan.fields.filter((f) => f.key === 'interact');
+      const job = await enqueue('extract', { tabId: args.tabId, plan: { ...plan, query: { ...options, limit: 120 } } });
+      const raw = (job.result && job.result.data && job.result.data.interact) || [];
+      const viewport = { w: 1920, h: 1080 };
+      const preference = memory.resolvePreference(memory.hostnameOf(tab.url));
+      const analyzed = analyzeInteract(raw, { ...options, viewport, preference });
+      const capturedAt = new Date().toISOString();
+      snapshots.set(args.tabId, { url: job.result?.url || tab.url, capturedAt, viewport, raw, items: analyzed.items, zones: analyzed.zones, preference });
+      return { adapter: 'interact', url: tab.url, title: tab.title, total: analyzed.total, capturedAt, viewport, zones: analyzed.zones };
+    }
+    const adapter = adapters.forUrl(tab.url);
     const job = await enqueue('extract', { tabId: args.tabId, plan: { ...adapter.plan(tab.url, options), query: options } });
     return compactJob(job, { adapter: adapter.name });
   }
   if (name === 'browser_action') {
-    if (!['navigate', 'click', 'fill'].includes(args.action)) throw new Error('action must be navigate, click, or fill');
-    return compactJob(await enqueue(args.action, args));
+    const tab = (await tabs()).find((item) => item.id === args.tabId);
+    if (!tab) throw new Error('Unknown tabId. Call browser_tabs again.');
+    return compactJob(await dispatchAction(tab, args));
+  }
+  if (name === 'browser_mark') {
+    const tab = (await tabs()).find((item) => item.id === args.tabId);
+    if (!tab) throw new Error('Unknown tabId. Call browser_tabs again.');
+    const domain = memory.hostnameOf(tab.url);
+    if (!domain) throw new Error('Cannot determine page domain');
+    // 'list' needs no element resolution.
+    if (args.action === 'list') {
+      return { domain, memory: memory.listMemory(domain) };
+    }
+    // Resolve cues from the latest interact snapshot index, or from a selector.
+    let cues = null;
+    if (args.index !== undefined) {
+      const item = itemFor(tab, args);
+      cues = buildCuesFromItem(item);
+    } else if (args.selector) {
+      const snap = snapshots.get(args.tabId);
+      const item = snap && snap.items.find((it) => it.selector === args.selector);
+      cues = item ? buildCuesFromItem(item) : { kind: null, text: null, href: null, ariaLabel: null, selector: args.selector };
+    } else {
+      throw new Error('browser_mark requires index or selector');
+    }
+    if (args.action === 'important' || args.action === 'unimportant') {
+      const mark = memory.markElement(domain, cues, args.action, 'manual');
+      memory.saveNow();
+      return { domain, action: args.action, mark, memory: memory.listMemory(domain) };
+    }
+    if (args.action === 'clear') {
+      const res = memory.clearElement(domain, cues);
+      memory.saveNow();
+      return { domain, action: 'clear', ...res, memory: memory.listMemory(domain) };
+    }
+    throw new Error(`unknown browser_mark action ${args.action}`);
   }
   if (name === 'browser_download') return compactJob(await enqueueBackground('download', args));
   if (name === 'browser_job_status') return compactJob(await jobStatus(args.jobId));

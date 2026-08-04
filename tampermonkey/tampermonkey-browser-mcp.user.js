@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.6.0
+// @version      0.7.4
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_download
 // @connect      127.0.0.1
 // @noframes
 // ==/UserScript==
@@ -85,11 +86,51 @@
     };
   }
   function bounded(value, limit) { return clean(value).slice(0, Math.min(Number(limit) || 1000, 8000)); }
+  // Physical-state collectors (geometry + flattened ancestor chain). These
+  // report browser-only facts; interpretation stays on the local MCP server.
+  function geometry(item) {
+    if (!item || item.nodeType !== Node.ELEMENT_NODE) return null;
+    const r = item.getBoundingClientRect();
+    return { x: Math.round(r.left * 10) / 10, y: Math.round(r.top * 10) / 10, w: Math.round(r.width * 10) / 10, h: Math.round(r.height * 10) / 10 };
+  }
+  function flatPath(item, maxDepth = 8) {
+    const parts = [];
+    let el = item;
+    while (el && el.nodeType === Node.ELEMENT_NODE && parts.length < maxDepth) {
+      // SVG elements expose classList as SVGAnimatedString (baseVal), which is
+      // not iterable — guard so extraction never throws on icon-heavy pages.
+      let classes = [];
+      try {
+        const list = el.classList;
+        if (list && typeof list.length === 'number' && typeof list.item === 'function') {
+          for (let i = 0; i < list.length; i += 1) classes.push(String(list.item(i)));
+        } else if (typeof list === 'string') classes = [list];
+      } catch { /* ignore class collection errors */ }
+      classes = classes.slice(0, 3);
+      let nth = null;
+      const parent = el.parentElement;
+      if (parent) {
+        const same = [...parent.children].filter((s) => s.tagName === el.tagName);
+        if (same.length > 1) nth = same.indexOf(el) + 1;
+      }
+      parts.push({ tag: el.tagName.toLowerCase(), id: el.id || null, class: classes, nth });
+      el = parent;
+    }
+    return parts;
+  }
   function property(item, name) {
     if (!item) return null;
     if (name === 'text') return bounded(item.innerText || item.textContent || item.value, 240);
     if (name === 'href') return item.href || item.getAttribute('href') || null;
     if (name === 'tag') return item.tagName.toLowerCase();
+    if (name === 'rect') return geometry(item);
+    if (name === 'isDisplayed') return visible(item);
+    if (name === 'disabled') return item.disabled === true || item.hasAttribute('disabled');
+    if (name === 'checked') return item.checked === true;
+    if (name === 'value') return item.value != null ? String(item.value) : null;
+    if (name === 'type') return item.getAttribute('type') || (item.type != null ? String(item.type) : null);
+    if (name === 'role') return item.getAttribute('role') || null;
+    if (name === 'path') return flatPath(item);
     return item.getAttribute(name) || item[name] || null;
   }
   function visible(item) {
@@ -118,7 +159,7 @@
     const data = {};
     for (const field of fields) {
       if (!field || typeof field.key !== 'string' || !validSelector(field.selector)) continue;
-      const limit = Math.min(Number(field.limit) || 20, 100);
+      const limit = Math.min(Number(field.limit) || 20, 250);
       if (field.kind === 'text') {
         const item = document.querySelector(field.selector);
         data[field.key] = matches(item, query) ? cleanedText(item, field.limit) : '';
@@ -128,9 +169,9 @@
         data[field.key] = matches(item, query) ? property(item, field.attribute || 'text') : null;
       }
       if (field.kind === 'list') {
-        const properties = Array.isArray(field.properties) ? field.properties.slice(0, 16) : ['text'];
+        const properties = Array.isArray(field.properties) ? field.properties.slice(0, 24) : ['text'];
         const offset = Math.max(Number(query.offset) || 0, 0);
-        const wanted = Math.min(Number(query.limit) || limit, 100);
+        const wanted = Math.min(Number(query.limit) || limit, 250);
         data[field.key] = [...document.querySelectorAll(field.selector)].slice(0, 5000).filter((item) => matches(item, query)).slice(offset, offset + wanted).map((item) => Object.fromEntries(properties.map((name) => [name, property(item, name)])));
       }
     }
@@ -209,6 +250,20 @@
     setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
     return { downloadTriggered: true, downloadMode: 'forced', url: target.href, bytes: blob.size, filename: link.download };
   }
+  function gmDownload(url, filename, jobId) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_download !== 'function') return reject(new Error('GM_download unavailable'));
+      reportProgress(jobId, 0, null, 'downloading');
+      GM_download({
+        url,
+        name: safeFilename(filename, 'download'),
+        saveAs: false,
+        onload: () => { reportProgress(jobId, 0, null, 'completed'); resolve({ downloadTriggered: true, downloadMode: 'gm', url, filename: safeFilename(filename, 'download') }); },
+        onerror: (err) => reject(new Error(`GM_download failed: ${(err && err.error) || 'unknown'}`)),
+        ontimeout: () => reject(new Error('GM_download timed out')),
+      });
+    });
+  }
   function activeJob() {
     if (tabState.activeJob) return tabState.activeJob;
     try { return JSON.parse(sessionStorage.getItem('tm-browser-mcp-active-job')); } catch { return null; }
@@ -239,13 +294,24 @@
         setActiveJob({ job, phase: 'afterClick' });
         click(payload.selector);
       }
-      await wait(500);
+      await wait(300);
       return { result: pageState() };
     }
     if (job.type === 'download') {
       if (payload.url) {
         const target = new URL(payload.url, location.href).href;
-        if (payload.force) {
+        // Default to a forced download: browsers preview PDFs inline by default,
+        // so a plain navigation would open the viewer instead of saving the
+        // file. Prefer GM_download — it is browser-level, works cross-origin,
+        // and saveAs:false writes the file directly (bypassing the inline
+        // viewer). forceDownload (fetch→blob) only works same-origin, so use it
+        // as the fallback. Pass preview:true to opt into the browser's own
+        // inline-view / default behavior instead.
+        if (payload.preview) {
+          return { result: { downloadTriggered: true, downloadMode: 'preview', url: target }, downloadTo: target };
+        }
+        if (typeof GM_download === 'function') return { result: await gmDownload(target, payload.filename, job.id) };
+        if (payload.force || new URL(target).origin === location.origin) {
           const forced = await forceDownload(target, payload.filename, job.id);
           if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
           return { result: forced };
@@ -253,6 +319,59 @@
         return { result: { downloadTriggered: true, downloadMode: 'browser', url: target }, downloadTo: target };
       }
       return { result: { downloadTriggered: true, ...pageState() }, clickAfter: payload.selector };
+    }
+    if (job.type === 'scroll') {
+      if (validSelector(payload.selector)) {
+        const el = document.querySelector(payload.selector);
+        if (el) el.scrollIntoView({ block: 'center' });
+        else throw new Error('Element not found');
+      } else if (Number.isFinite(payload.x) || Number.isFinite(payload.y)) window.scrollTo(Number(payload.x) || 0, Number(payload.y) || 0);
+      else if (Number.isFinite(payload.dx) || Number.isFinite(payload.dy)) window.scrollBy(Number(payload.dx) || 0, Number(payload.dy) || 0);
+      else throw new Error('scroll requires selector, x/y, or dx/dy');
+      return { result: pageState() };
+    }
+    if (job.type === 'focus') {
+      if (!validSelector(payload.selector)) throw new Error('Invalid selector');
+      const el = document.querySelector(payload.selector);
+      if (!el) throw new Error('Element not found');
+      el.focus();
+      return { result: pageState() };
+    }
+    if (job.type === 'hover') {
+      if (!validSelector(payload.selector)) throw new Error('Invalid selector');
+      const el = document.querySelector(payload.selector);
+      if (!el) throw new Error('Element not found');
+      const r = el.getBoundingClientRect();
+      const o = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+      for (const type of ['pointerover', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new MouseEvent(type, o));
+      return { result: pageState() };
+    }
+    if (job.type === 'key') {
+      const el = (validSelector(payload.selector) && document.querySelector(payload.selector)) || document.activeElement;
+      if (!el) throw new Error('No target for key event');
+      const key = String(payload.key ?? '');
+      if (!key) throw new Error('key is required');
+      const code = payload.code || key;
+      for (const type of ['keydown', 'keypress', 'keyup']) el.dispatchEvent(new KeyboardEvent(type, { key, code, bubbles: true, cancelable: true, composed: true }));
+      return { result: pageState() };
+    }
+    if (job.type === 'clickPoint') {
+      const x = Number(payload.x), y = Number(payload.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('clickPoint requires x and y');
+      const el = document.elementFromPoint(x, y);
+      if (!el) throw new Error('No element at point');
+      const target = el.closest('button, a[href], input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]') || el;
+      if (typeof target.click !== 'function') throw new Error('Element at point is not clickable');
+      target.click();
+      return { result: pageState() };
+    }
+    if (job.type === 'verifyPoint') {
+      const x = Number(payload.x), y = Number(payload.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('verifyPoint requires x and y');
+      const el = document.elementFromPoint(x, y);
+      if (!el) throw new Error('No element at point');
+      const target = el.closest('button, a[href], input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]') || el;
+      return { result: { ...pageState(), found: { tag: target.tagName.toLowerCase(), text: bounded(target.innerText || target.textContent || '', 120), href: target.href || null, rect: geometry(target) } } };
     }
     throw new Error(`Unsupported action: ${job.type}`);
   }
@@ -277,17 +396,30 @@
     } finally {
       busy = false;
       paint();
+      // Always resume the poll loop after a job. During a navigation the
+      // pre-scheduled setTimeout(poll) is torn down with the page, so this
+      // finally — and the new page's boot path — restart the loop.
+      pollDelay = 60;
+      setTimeout(poll, pollDelay);
     }
   }
+  let pollDelay = 1200;
   async function poll() {
     mountButton();
-    if (!enabled) return;
-    try {
-      const response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy });
-      if (!busy && response.job) await run(response.job);
-    } catch { paint('bridge offline'); }
+    if (!enabled) { pollDelay = 1200; setTimeout(poll, pollDelay); return; }
+    let response;
+    try { response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy }); }
+    catch { paint('bridge offline'); pollDelay = 1200; setTimeout(poll, pollDelay); return; }
+    if (response.job && !busy) {
+      // run()'s finally always reschedules poll(); do not double-schedule here,
+      // otherwise two poll loops fight. Long jobs still get heartbeats because
+      // run() posts /poll{busy:true} only on demand — see run().
+      run(response.job);
+    } else {
+      pollDelay = response.pending > 0 ? 150 : 1200;
+      setTimeout(poll, pollDelay);
+    }
   }
-  setInterval(poll, 1200);
   setTimeout(() => {
     const active = activeJob();
     if (enabled && active?.job) run(active.job, active.phase);

@@ -111,8 +111,8 @@ function publicJob(job) {
 }
 
 function validateJob(body) {
-  const allowed = new Set(['navigate', 'extract', 'inspect', 'click', 'fill', 'download']);
-  if (!body || !allowed.has(body.type)) throw new Error('type must be navigate, extract, inspect, click, fill, or download');
+  const allowed = new Set(['navigate', 'extract', 'inspect', 'click', 'fill', 'download', 'scroll', 'focus', 'hover', 'key', 'clickPoint', 'verifyPoint']);
+  if (!body || !allowed.has(body.type)) throw new Error('type must be navigate, extract, inspect, click, fill, download, scroll, focus, hover, key, clickPoint, or verifyPoint');
   if (!body.payload || typeof body.payload !== 'object' || Array.isArray(body.payload)) throw new Error('payload must be an object');
   if (body.target != null && (typeof body.target !== 'string' || body.target.length > 128)) throw new Error('target must be a client id');
   return { type: body.type, payload: body.payload, target: body.target || null };
@@ -157,7 +157,8 @@ const server = http.createServer(async (request, response) => {
         job.clientId = body.clientId;
         job.claimedAt = new Date().toISOString();
       }
-      return send(response, 200, { job: job ? publicJob(job) : null });
+      const pending = state.jobs.filter((item) => item.status === 'queued' && (!item.target || item.target === body.clientId)).length;
+      return send(response, 200, { job: job ? publicJob(job) : null, pending });
     }
     if (request.method === 'POST' && url.pathname === '/result') {
       const body = await parseBody(request);
