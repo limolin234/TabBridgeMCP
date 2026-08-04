@@ -425,10 +425,27 @@
     if (enabled && active?.job) run(active.job, active.phase);
     else poll();
   }, 500);
-  // Robustness: when the tab becomes visible again or is restored from the
-  // back/forward cache, resume polling immediately instead of waiting for the
-  // next idle tick — recovers from page-level stalls (heavy SPA re-renders,
-  // cookie/consent overlays) without a manual refresh.
+  // -- Consent-overlay / page-stall resilience (v0.7.5) ---------------------
+  // WHY THIS EXISTS: some sites (ACM Digital Library, Stack Overflow, others)
+  // inject heavy consent/cookie overlays or login-gate JS that runs *on top of*
+  // the page but inside the same document. That script can temporarily freeze
+  // or re-render the DOM in a way that stalls our `setTimeout(poll)` chain: the
+  // scheduled callback keeps getting deferred (busy main thread) and the tab
+  // stops reporting to the bridge — it looks "offline" until the user manually
+  // refreshes. This is NOT a navigation bug: cross-origin navigation alone was
+  // verified safe (clientId survives). It is specifically overlay/SPA stalls.
+  //
+  // WHY THESE EVENTS: there is no reliable "main thread is free again" event.
+  // But a tab that was stalled by an overlay becomes visible again once the
+  // overlay is dismissed or the user switches away and back — that's
+  // `visibilitychange`. And bfcache restore fires `pageshow`. Both are cheap,
+  // fire in the exact "user is looking again" moment, and calling `poll()`
+  // directly re-arms the loop immediately instead of waiting up to 1200ms.
+  //
+  // WHY NOT A FIXED FASTER INTERVAL: a permanent 100ms poll would catch stalls
+  // sooner but burns CPU / battery and still doesn't help when the main thread
+  // is genuinely frozen (the timer itself can't fire). Event-driven re-arming
+  // is the right recovery; the steady-state interval stays low.
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) poll();
   });
