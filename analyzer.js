@@ -353,27 +353,40 @@ function canonicalClasses(classes) {
   return [...set].sort().join('.');
 }
 
-function hrefPattern(href) {
+// Group key only: unlike hrefPattern (mark matching), grouping keeps the FULL
+// path — folding numeric segments would wrongly merge distinct entity pages
+// (news articles /newsDetail_forward_3371492 and 3371493, papers /document/123
+// and 456). Query strings ARE folded — /group/explore?tag=A and ?tag=B are one
+// nav list, not separate pages.
+function groupHrefPattern(href) {
   if (!href) return null;
   try {
     const u = new URL(href, 'https://x');
-    const p = u.pathname.replace(/\d+/g, '').replace(/\/+/g, '/');
+    let p = u.pathname.replace(/\/+/g, '/');
     if (!p || p === '/' || p === '/#') return null;
     return p;
   } catch { return null; }
 }
 
-// Group key: kind + (canonical class set OR href pattern). Form controls
+// Group key: kind + (href pattern for links, canonical class set otherwise).
+// A link's href is the semantic identity — two different articles share layout
+// classes (thepaper's inheritfqv_, a feed row) but never the same href pattern,
+// so grouping links by class would wrongly merge distinct stories. Links group
+// by href pattern when one exists; a class-based fallback covers links without
+// a meaningful href (javascript:void(0), modal openers). Buttons/clickables
+// have no href, so they group by canonical class set. Form controls
 // (input/textarea/select) never group — each has a distinct purpose.
 function groupKeyFor(item) {
   if (!GROUPABLE_KINDS.has(item.kind)) return null;
   const ownClasses = item.path && item.path[0] && item.path[0].class ? item.path[0].class : [];
   const canon = canonicalClasses(ownClasses);
-  if (canon) return `${item.kind}|class:${canon}`;
   if (item.kind === 'link') {
-    const hp = hrefPattern(item.href);
+    const hp = groupHrefPattern(item.href);
     if (hp) return `${item.kind}|href:${hp}`;
+    if (canon) return `${item.kind}|class:${canon}`;
+    return null;
   }
+  if (canon) return `${item.kind}|class:${canon}`;
   return null;
 }
 
@@ -387,6 +400,11 @@ function distance(a, b) {
 // Greedy spatial chaining: candidates in salience order; each joins the nearest
 // open group with the same key if within 320px, else seeds a new group. A group
 // of count 1 is dissolved back into the flow (a lone CTA is not a "group").
+// Each group carries avgTextLen — the mean length of non-empty member text —
+// which assignZones uses to tell homogeneous helper clusters (vote arrows, hide
+// buttons: short/identical text) from entity lists (video titles, news
+// headlines: long, distinct text). The latter must NOT be collapsed into one
+// representative — they are distinct targets.
 function buildGroups(candidates, viewport) {
   const groups = [];
   const byKey = new Map();
@@ -416,7 +434,22 @@ function buildGroups(candidates, viewport) {
       byKey.get(key).push(group);
     }
   }
-  return groups.filter((g) => g.members.length >= 2);
+  const sized = groups.filter((g) => g.members.length >= 2);
+  for (const g of sized) {
+    const texts = g.members.map((m) => String(m.text || '').trim()).filter(Boolean);
+    g.avgTextLen = texts.length ? texts.reduce((s, t) => s + t.length, 0) / texts.length : 0;
+  }
+  return sized;
+}
+
+// An entity list is a cluster whose members are DISTINCT long-text targets
+// (video titles, news headlines), not interchangeable helpers. Collapsing them
+// into one representative would hide that "51 headlines" means 51 real pages
+// to click. Homogeneous helpers (vote arrows, hide, navbar) have short or
+// identical text and merge fine.
+function isEntityGroup(group) {
+  if (!group.members || group.members.length < 2) return false;
+  return group.avgTextLen >= 14;
 }
 
 // ---- Zone assignment ------------------------------------------------------
@@ -446,17 +479,27 @@ function assignZones(items, options = {}) {
   const visibleMain = visible.filter((it) => !it._noise);
   const offscreenMain = offscreen.filter((it) => !it._noise);
 
-  // Group FIRST: similar in-viewport elements (hot-search rows, nav clusters)
-  // merge into groups before primary is chosen, so a row of 12 hot-links never
-  // floods the primary zone. Marked-unimportant and NOISE elements never seed a
-  // group — a cluster of cookie-banner buttons must not become a "group".
-  const groupable = visibleMain.filter((it) => groupKeyFor(it) !== null && !(it.pref && it.pref.unimportant));
+  // Group FIRST: similar elements (hot-search rows, nav clusters, off-screen
+  // card feeds) merge into groups before primary is chosen, so a row of 12
+  // hot-links or 20 feed cards never floods the zones. Off-screen elements
+  // group too — without it, long feeds (douban group cards) lay flat as 50+
+  // secondary rows. Marked-unimportant and NOISE elements never seed a group —
+  // a cluster of cookie-banner buttons must not become a "group".
+  const groupable = [...visibleMain, ...offscreenMain].filter((it) => groupKeyFor(it) !== null && !(it.pref && it.pref.unimportant));
   const grouped = buildGroups(groupable.map((it) => ({ ...it })), options.viewport);
+  // Entity groups (long distinct member text: video titles, news headlines)
+  // are NOT collapsed to one representative — each member is a real clickable
+  // page. They dissolve back into the flow and surface as a truncated list in
+  // secondary (capped with an "and N more" note). Homogeneous helper groups
+  // (vote arrows, hide, navbar) stay merged.
+  const entityGroups = new Set();
+  const entityMemberKeys = new Set();
   const groupedMemberKeys = new Set();
   for (const g of grouped) {
+    if (isEntityGroup(g)) { entityGroups.add(g); g.members.forEach((m) => entityMemberKeys.add(m._k)); continue; }
     g.members.forEach((m) => groupedMemberKeys.add(m._k));
   }
-  const groupedMeta = grouped.map((g) => ({
+  const groupedMeta = grouped.filter((g) => !entityGroups.has(g)).map((g) => ({
     groupKey: g.key,
     kind: g.kind,
     label: (g.rep.text || '').slice(0, 40) || g.rep.ariaLabel || g.rep.kind,
@@ -496,11 +539,36 @@ function assignZones(items, options = {}) {
   primary = [...manualImportant, ...primary, ...presetImportant].slice(0, 10 + manualImportant.length);
   const primaryKeys = new Set(primary.map((it) => it._k));
 
-  // secondary = visible not primary not grouped-member, then off-screen.
+  // Entity-list truncation: a dissolved entity group (51 news headlines, 15
+  // video titles) must not re-flatten into rows. Keep the top
+  // ENTITY_SHOW_PER_PATTERN per pattern across both viewports and attach one
+  // "还有 N 个同类" pseudo-element so the AI knows the list is longer without
+  // paying for every row.
+  const ENTITY_SHOW_PER_PATTERN = 6;
+  const entityPatternOf = (it) => (entityMemberKeys.has(it._k) ? groupKeyFor(it) : null);
+  const allEntityMembers = [...visibleMain, ...offscreenMain].filter((it) => entityPatternOf(it));
+  const keep = new Set();
+  const moreByPattern = new Map();
+  for (const it of allEntityMembers.sort((a, b) => b.score - a.score)) {
+    const p = entityPatternOf(it);
+    if (!moreByPattern.has(p)) moreByPattern.set(p, 0);
+    if (moreByPattern.get(p) < ENTITY_SHOW_PER_PATTERN) { keep.add(it._k); moreByPattern.set(p, moreByPattern.get(p) + 1); }
+  }
+  const moreCount = (p) => allEntityMembers.filter((it) => entityPatternOf(it) === p).length - ENTITY_SHOW_PER_PATTERN;
+
+  // secondary = visible not primary not grouped-member (entity lists truncated),
+  // then off-screen (also excluding grouped members — an off-screen card feed
+  // must collapse to its group representative, not re-flatten into rows).
+  const visPool = visibleMain.filter((it) => !primaryKeys.has(it._k) && !groupedMemberKeys.has(it._k) && (keep.has(it._k) || !entityPatternOf(it)));
+  const offPool = offscreenMain.filter((it) => !groupedMemberKeys.has(it._k) && (keep.has(it._k) || !entityPatternOf(it)));
   secondary.push(
-    ...visibleMain.filter((it) => !primaryKeys.has(it._k) && !groupedMemberKeys.has(it._k)).sort((a, b) => b.score - a.score).slice(0, limit),
-    ...offscreenMain.sort((a, b) => b.score - a.score).slice(0, Math.max(0, limit - visibleMain.length)),
+    ...visPool.sort((a, b) => b.score - a.score).slice(0, limit),
+    ...offPool.sort((a, b) => b.score - a.score).slice(0, Math.max(0, limit - visPool.length)),
   );
+  for (const p of moreByPattern.keys()) {
+    const n = moreCount(p);
+    if (n > 0) secondary.push({ _k: null, _groupedMore: true, kind: 'more', tag: 'a', text: `还有 ${n} 个同类`, groupKey: p, selector: null, score: -1 });
+  }
 
   return { primary, secondary, grouped: groupedMeta, hidden };
 }
