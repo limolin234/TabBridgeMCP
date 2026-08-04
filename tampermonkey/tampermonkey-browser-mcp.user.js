@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.3.1
+// @version      0.4.0
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -148,6 +148,28 @@
     if (!item) throw new Error('Element not found');
     item.click();
   }
+  function safeFilename(value, fallback = 'download') {
+    const name = String(value || '').trim().replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180);
+    return name || fallback;
+  }
+  async function forceDownload(url, filename) {
+    const target = new URL(url, location.href);
+    if (target.origin !== location.origin) return { fallbackTo: target.href };
+    const response = await fetch(target.href, { credentials: 'include' });
+    if (!response.ok) throw new Error(`Download request failed: HTTP ${response.status}`);
+    const blob = await response.blob();
+    const fallback = safeFilename(decodeURIComponent(target.pathname.split('/').pop() || ''), 'download');
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = safeFilename(filename, fallback);
+    link.style.display = 'none';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+    return { downloadTriggered: true, downloadMode: 'forced', url: target.href, bytes: blob.size, filename: link.download };
+  }
   function activeJob() {
     try { return JSON.parse(sessionStorage.getItem('tm-browser-mcp-active-job')); } catch { return null; }
   }
@@ -171,7 +193,15 @@
       return { result: pageState() };
     }
     if (job.type === 'download') {
-      if (payload.url) return { result: { downloadTriggered: true, url: new URL(payload.url, location.href).href }, downloadTo: payload.url };
+      if (payload.url) {
+        const target = new URL(payload.url, location.href).href;
+        if (payload.force) {
+          const forced = await forceDownload(target, payload.filename);
+          if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
+          return { result: forced };
+        }
+        return { result: { downloadTriggered: true, downloadMode: 'browser', url: target }, downloadTo: target };
+      }
       return { result: { downloadTriggered: true, ...pageState() }, clickAfter: payload.selector };
     }
     throw new Error(`Unsupported action: ${job.type}`);

@@ -139,6 +139,16 @@ completed tool result means only that the URL or click was triggered. The
 userscript cannot report a final filesystem path or prove completion, and
 sign-in, purchase gates, pop-up blocking, and site handlers still apply.
 
+For a direct same-origin file URL that the browser would preview inline, pass
+`force: true` (and optionally `filename`). The userscript fetches it with the
+current page session and triggers a Blob download. Cross-origin URLs or failed
+fetches fall back to the browser's normal navigation; selector downloads always
+keep the site's native click behavior.
+
+```json
+{"tabId":"TAB_ID","url":"https://example.com/paper.pdf","force":true,"filename":"paper.pdf"}
+```
+
 Private adapters can be loaded with `TABBRIDGE_ADAPTERS_DIR`; see
 [`adapters/README.md`](adapters/README.md). This keeps organization-specific
 and site-specific rules outside the public repository.
