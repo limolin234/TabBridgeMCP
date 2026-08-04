@@ -66,9 +66,14 @@ The public MCP surface stays fixed: `browser_tabs`, `browser_read`,
 `browser_action`, `browser_download`, and debug-only `browser_inspect`.
 
 `browser_read` selects a server-side adapter from the page URL and sends a
-declarative DOM extraction plan to the browser. The bundled `generic` adapter
-returns a bounded title, main text, headings, links, and controls. It does not
-send raw page HTML or a full page dump by default.
+declarative DOM extraction plan to the browser. Its `mode` can be `summary`,
+`text`, `elements`, `links`, `controls`, or `media`; `selector`, `contains`,
+`visible`, `limit`, and `offset` provide bounded filtering without adding a
+separate tool for every page shape. The bundled `generic` adapter performs
+small browser-side cleanup (hidden/script-like nodes, whitespace, bounded
+fields) and returns structured data. It does not send raw page HTML or a full
+page dump by default; `browser_inspect` remains the bounded fallback when the
+cleaned views are insufficient.
 
 Private adapters can be loaded with `TABBRIDGE_ADAPTERS_DIR`; see
 [`adapters/README.md`](adapters/README.md). This keeps organization-specific

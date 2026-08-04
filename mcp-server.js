@@ -91,9 +91,13 @@ async function enqueue(type, payload) {
   throw new Error(`Browser tab did not complete the action within ${timeoutFor(type) / 1000}s (job ${queued.job.id}, last status: ${lastStatus})`);
 }
 
+function compactJob(job, extra = {}) {
+  return { jobId: job.id, status: job.status, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...extra };
+}
+
 const tools = [
   { name: 'browser_tabs', description: 'List explicitly enabled dedicated browser tabs.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'browser_read', description: 'Read a compact, adapter-selected structured view of one tab. It never returns raw HTML.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_read', description: 'Read a cleaned, layered view of one tab. Use inspect only when this is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['summary', 'text', 'elements', 'links', 'controls', 'media'] }, selector: { type: 'string' }, contains: { type: 'string' }, visible: { type: 'boolean' }, limit: { type: 'number' }, offset: { type: 'number' } }, required: ['tabId'] } },
   { name: 'browser_action', description: 'Navigate, click, or fill one dedicated tab.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['navigate', 'click', 'fill'] }, url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' } }, required: ['tabId', 'action'] } },
   { name: 'browser_download', description: 'Use the normal browser session to follow a URL or click a download control; it never bypasses access checks.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' } }, required: ['tabId'] } },
   { name: 'browser_inspect', description: 'Debug-only bounded fallback. Request limited plain text or HTML only when browser_read is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['text', 'html'] }, limit: { type: 'number' } }, required: ['tabId'] } },
@@ -105,15 +109,16 @@ async function callTool(name, args = {}) {
     const tab = (await tabs()).find((item) => item.id === args.tabId);
     if (!tab) throw new Error('Unknown tabId. Call browser_tabs again.');
     const adapter = adapters.forUrl(tab.url);
-    const job = await enqueue('extract', { tabId: args.tabId, plan: adapter.plan(tab.url) });
-    return { adapter: adapter.name, ...job };
+    const options = { mode: args.mode || 'summary', selector: args.selector, contains: args.contains, visible: args.visible, limit: args.limit, offset: args.offset };
+    const job = await enqueue('extract', { tabId: args.tabId, plan: { ...adapter.plan(tab.url, options), query: options } });
+    return compactJob(job, { adapter: adapter.name });
   }
   if (name === 'browser_action') {
     if (!['navigate', 'click', 'fill'].includes(args.action)) throw new Error('action must be navigate, click, or fill');
-    return enqueue(args.action, args);
+    return compactJob(await enqueue(args.action, args));
   }
-  if (name === 'browser_download') return enqueue('download', args);
-  if (name === 'browser_inspect') return enqueue('inspect', { ...args, mode: args.mode || 'text', limit: args.limit || 4000 });
+  if (name === 'browser_download') return compactJob(await enqueue('download', args));
+  if (name === 'browser_inspect') return compactJob(await enqueue('inspect', { ...args, mode: args.mode || 'text', limit: args.limit || 4000 }));
   throw new Error('Unknown tool');
 }
 
@@ -132,7 +137,7 @@ process.stdin.on('data', async (chunk) => {
     let message;
     try { message = JSON.parse(line); } catch { continue; }
     if (message.id === undefined) continue;
-    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '0.2.0' } } });
+    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '0.3.0' } } });
     else if (message.method === 'tools/list') send({ jsonrpc: '2.0', id: message.id, result: { tools } });
     else if (message.method === 'tools/call') {
       try { send({ jsonrpc: '2.0', id: message.id, result: content(await callTool(message.params?.name, message.params?.arguments)) }); }

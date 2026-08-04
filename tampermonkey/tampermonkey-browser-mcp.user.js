@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.2.1
+// @version      0.3.0
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -66,22 +66,51 @@
   function bounded(value, limit) { return clean(value).slice(0, Math.min(Number(limit) || 1000, 8000)); }
   function property(item, name) {
     if (!item) return null;
-    if (name === 'text') return bounded(item.innerText || item.textContent || item.value, 1000);
+    if (name === 'text') return bounded(item.innerText || item.textContent || item.value, 240);
     if (name === 'href') return item.href || item.getAttribute('href') || null;
     if (name === 'tag') return item.tagName.toLowerCase();
     return item.getAttribute(name) || item[name] || null;
   }
+  function visible(item) {
+    if (!item || item.nodeType !== Node.ELEMENT_NODE) return false;
+    const style = getComputedStyle(item);
+    return style.display !== 'none' && style.visibility !== 'hidden' && item.getClientRects().length > 0;
+  }
+  function excluded(item) {
+    return ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(item?.tagName);
+  }
+  function matches(item, query) {
+    if (excluded(item)) return false;
+    if (query.visible === true && !visible(item)) return false;
+    if (query.contains && !clean(item.innerText || item.textContent || item.value).toLowerCase().includes(String(query.contains).toLowerCase())) return false;
+    return true;
+  }
+  function cleanedText(item, limit) {
+    if (!item) return '';
+    const copy = item.cloneNode(true);
+    copy.querySelectorAll('script, style, noscript, template, [hidden]').forEach((node) => node.remove());
+    return bounded(copy.textContent, limit);
+  }
   function extract(plan) {
     const fields = Array.isArray(plan?.fields) ? plan.fields.slice(0, 20) : [];
+    const query = plan?.query || {};
     const data = {};
     for (const field of fields) {
       if (!field || typeof field.key !== 'string' || !validSelector(field.selector)) continue;
       const limit = Math.min(Number(field.limit) || 20, 100);
-      if (field.kind === 'text') data[field.key] = bounded(document.querySelector(field.selector)?.textContent, field.limit);
-      if (field.kind === 'attribute') data[field.key] = property(document.querySelector(field.selector), field.attribute || 'text');
+      if (field.kind === 'text') {
+        const item = document.querySelector(field.selector);
+        data[field.key] = matches(item, query) ? cleanedText(item, field.limit) : '';
+      }
+      if (field.kind === 'attribute') {
+        const item = document.querySelector(field.selector);
+        data[field.key] = matches(item, query) ? property(item, field.attribute || 'text') : null;
+      }
       if (field.kind === 'list') {
-        const properties = Array.isArray(field.properties) ? field.properties.slice(0, 8) : ['text'];
-        data[field.key] = [...document.querySelectorAll(field.selector)].slice(0, limit).map((item) => Object.fromEntries(properties.map((name) => [name, property(item, name)])));
+        const properties = Array.isArray(field.properties) ? field.properties.slice(0, 16) : ['text'];
+        const offset = Math.max(Number(query.offset) || 0, 0);
+        const wanted = Math.min(Number(query.limit) || limit, 100);
+        data[field.key] = [...document.querySelectorAll(field.selector)].slice(0, 5000).filter((item) => matches(item, query)).slice(offset, offset + wanted).map((item) => Object.fromEntries(properties.map((name) => [name, property(item, name)])));
       }
     }
     return { ...pageState(), data };
