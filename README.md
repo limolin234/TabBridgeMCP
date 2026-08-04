@@ -15,25 +15,64 @@ control, or solves CAPTCHAs. When a page needs sign-in or human verification,
 the MCP tool returns a blocked result and the user completes it in that same
 ordinary browser tab.
 
-## Install
+## Quickstart
 
-1. In Tampermonkey, import `tampermonkey/tampermonkey-browser-mcp.user.js`.
-   It requests permission for HTTP(S) pages, but is **off by default** in every
-   tab. Enable only the tabs that an agent may use.
-2. Add this MCP entry to the client configuration:
+You need Node.js 18 or newer, a Tampermonkey-supported browser, and an MCP
+client such as Codex.
+
+1. Clone the repository and keep it at a stable path:
+
+```sh
+git clone https://github.com/limolin234/TabBridgeMCP.git
+cd TabBridgeMCP
+```
+
+2. Open the Tampermonkey dashboard, choose **Utilities > Import from file**, and
+   import `tampermonkey/tampermonkey-browser-mcp.user.js`. Confirm that the
+   script is enabled. The script has access to HTTP(S) pages, but Browser MCP is
+   **off by default in every tab**.
+
+3. Register the local MCP server. For Codex, run this from the repository:
+
+```sh
+codex mcp add tampermonkey_browser -- node "$PWD/mcp-server.js"
+codex mcp list
+```
+
+For another MCP client, add the equivalent stdio configuration with an
+absolute path:
 
 ```toml
 [mcp_servers.tampermonkey_browser]
 command = "node"
-args = ["/absolute/path/to/tabbridge-mcp/mcp-server.js"]
+args = ["/absolute/path/to/TabBridgeMCP/mcp-server.js"]
 ```
 
-3. Restart the MCP client. The MCP server starts a machine-wide local bridge
-   on demand. The bridge is a single shared instance (single-process lock on a
-   temp directory + port): when multiple MCP processes run concurrently, they
-   all converge on the same bridge and hand off instead of spawning private
-   copies. No separate daemon, service manager, browser launch, or profile
-   setup is required.
+4. Fully restart the MCP client so it reloads the tool schemas.
+
+5. Open a normal browser tab for the agent. Click the fixed **Browser MCP: off**
+   button in the bottom-right corner; it changes to **Browser MCP: ready**. If a
+   site temporarily removes the button during SPA navigation, the script mounts
+   it again. The Tampermonkey menu command **Toggle Browser MCP for this tab** is
+   the fallback.
+
+6. Ask the agent to call `browser_tabs`, select the enabled tab, and start with
+   `browser_read` in `summary` mode. Use one dedicated enabled tab per agent.
+
+The MCP server starts a machine-wide local bridge on demand. Concurrent MCP
+processes share that bridge on `127.0.0.1:18475`; no daemon, service manager,
+browser launch, or profile setup is required.
+
+### Updating
+
+```sh
+git pull --ff-only
+```
+
+Re-import the userscript in Tampermonkey when its `@version` changes. Fully
+restart the MCP client when `mcp-server.js` or its tool schemas change. Updating
+the checkout alone does not replace Tampermonkey's installed copy or an already
+running MCP process.
 
 ## Dedicated-tab workflow
 
@@ -65,6 +104,14 @@ interaction yourself, then let the agent continue with the same `tabId`.
 The public MCP surface stays fixed: `browser_tabs`, `browser_read`,
 `browser_action`, `browser_download`, and debug-only `browser_inspect`.
 
+| Tool | Use |
+| --- | --- |
+| `browser_tabs` | List tabs whose Browser MCP button is enabled. |
+| `browser_read` | Read a bounded, cleaned page view. Start with `summary`. |
+| `browser_action` | Navigate, click, or fill a selected tab. |
+| `browser_download` | Ask the normal browser session to follow or click a download. |
+| `browser_inspect` | Return bounded text or HTML when cleaned reads are insufficient. |
+
 `browser_read` selects a server-side adapter from the page URL and sends a
 declarative DOM extraction plan to the browser. Its `mode` can be `summary`,
 `text`, `elements`, `links`, `controls`, or `media`; `selector`, `contains`,
@@ -74,6 +121,23 @@ small browser-side cleanup (hidden/script-like nodes, whitespace, bounded
 fields) and returns structured data. It does not send raw page HTML or a full
 page dump by default; `browser_inspect` remains the bounded fallback when the
 cleaned views are insufficient.
+
+Typical reads use one tool with different levels rather than many specialized
+tools:
+
+```json
+{"tabId":"TAB_ID","mode":"summary"}
+{"tabId":"TAB_ID","mode":"text","selector":"main","limit":4000}
+{"tabId":"TAB_ID","mode":"elements","selector":"a, button, input","visible":true,"limit":50}
+{"tabId":"TAB_ID","mode":"links","contains":"PDF","visible":true,"limit":10}
+```
+
+`browser_download` preserves the site's normal browser behavior. If the site
+and browser treat the response as a download, it goes to the configured
+download directory; an inline PDF may instead open in the browser viewer. A
+completed tool result means only that the URL or click was triggered. The
+userscript cannot report a final filesystem path or prove completion, and
+sign-in, purchase gates, pop-up blocking, and site handlers still apply.
 
 Private adapters can be loaded with `TABBRIDGE_ADAPTERS_DIR`; see
 [`adapters/README.md`](adapters/README.md). This keeps organization-specific

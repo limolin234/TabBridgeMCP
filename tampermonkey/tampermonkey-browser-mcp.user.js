@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.3.0
+// @version      0.3.1
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      127.0.0.1
+// @noframes
 // ==/UserScript==
 
 (() => {
@@ -21,7 +22,11 @@
   const button = document.createElement('button');
   button.type = 'button';
   button.style.cssText = 'position:fixed;z-index:2147483647;right:12px;bottom:12px;padding:6px 9px;border:1px solid #777;border-radius:4px;background:#fff;color:#222;font:12px sans-serif;cursor:pointer;box-shadow:0 1px 3px #777';
+  function mountButton() {
+    if (document.body && !button.isConnected) document.body.append(button);
+  }
   function paint(note = '') {
+    mountButton();
     button.textContent = `Browser MCP: ${enabled ? (busy ? 'working' : 'ready') : 'off'}${note ? ` (${note})` : ''}`;
     button.style.background = enabled ? '#e7f4ea' : '#f5f5f5';
   }
@@ -30,8 +35,8 @@
     sessionStorage.setItem('tm-browser-mcp-enabled', String(enabled));
     paint();
   });
-  if (document.body) document.body.append(button);
-  else document.addEventListener('DOMContentLoaded', () => document.body.append(button), { once: true });
+  mountButton();
+  document.addEventListener('DOMContentLoaded', mountButton, { once: true });
   GM_registerMenuCommand('Toggle Browser MCP for this tab', () => button.click());
   paint();
 
@@ -195,6 +200,7 @@
     }
   }
   async function poll() {
+    mountButton();
     if (!enabled || busy) return;
     try {
       const response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title } });
