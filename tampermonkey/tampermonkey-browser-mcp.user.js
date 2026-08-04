@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.8
+// @version      0.7.10
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -21,7 +21,7 @@
     try { return JSON.parse(window.name.slice(tabStatePrefix.length)); } catch { return null; }
   }
   function writeTabState(state) {
-    window.name = `${tabStatePrefix}${JSON.stringify(state)}`;
+    try { window.name = `${tabStatePrefix}${JSON.stringify(state)}`; } catch { /* some pages guard window.name */ }
   }
   const storedTabState = readTabState();
   const legacyClientId = sessionStorage.getItem('tm-browser-mcp-client');
@@ -32,7 +32,7 @@
   // no sessionStorage entry, so it starts off — the GM-setValue experiment
   // (v0.7.6) wrongly made every new tab enabled because GM storage is global,
   // not per-tab.
-  const enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  let enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
   let tabState = { ...(storedTabState || {}), clientId, enabled };
   function updateTabState(patch) {
     tabState = { ...tabState, ...patch };
