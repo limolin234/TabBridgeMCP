@@ -101,8 +101,9 @@ interaction yourself, then let the agent continue with the same `tabId`.
 
 ## Tools And Adapters
 
-The public MCP surface stays fixed: `browser_tabs`, `browser_read`,
-`browser_action`, `browser_download`, and debug-only `browser_inspect`.
+The public MCP surface includes `browser_tabs`, `browser_read`,
+`browser_action`, `browser_download`, `browser_job_status`, and debug-only
+`browser_inspect`.
 
 | Tool | Use |
 | --- | --- |
@@ -110,6 +111,7 @@ The public MCP surface stays fixed: `browser_tabs`, `browser_read`,
 | `browser_read` | Read a bounded, cleaned page view. Start with `summary`. |
 | `browser_action` | Navigate, click, or fill a selected tab. |
 | `browser_download` | Ask the normal browser session to follow or click a download. |
+| `browser_job_status` | Read the status and byte progress of a background browser job. |
 | `browser_inspect` | Return bounded text or HTML when cleaned reads are insufficient. |
 
 `browser_read` selects a server-side adapter from the page URL and sends a
@@ -132,12 +134,12 @@ tools:
 {"tabId":"TAB_ID","mode":"links","contains":"PDF","visible":true,"limit":10}
 ```
 
-`browser_download` preserves the site's normal browser behavior. If the site
-and browser treat the response as a download, it goes to the configured
-download directory; an inline PDF may instead open in the browser viewer. A
-completed tool result means only that the URL or click was triggered. The
-userscript cannot report a final filesystem path or prove completion, and
-sign-in, purchase gates, pop-up blocking, and site handlers still apply.
+`browser_download` returns a background `jobId` immediately. Use
+`browser_job_status` to monitor `queued`, `claimed`, `completed`, or `error`;
+forced same-origin downloads also report received and total bytes (the latter
+may be `null`). Normal downloads still follow site and browser behavior and
+cannot report a final filesystem path; sign-in, purchase gates, pop-up
+blocking, and site handlers still apply.
 
 For a direct same-origin file URL that the browser would preview inline, pass
 `force: true` (and optionally `filename`). The userscript fetches it with the

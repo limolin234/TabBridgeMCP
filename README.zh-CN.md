@@ -84,6 +84,7 @@ git pull --ff-only
 | `browser_read` | 分层读取并清洗页面元素。 |
 | `browser_action` | 在指定标签页中跳转、点击或填写。 |
 | `browser_download` | 让当前浏览器跟随 URL 或点击下载控件。 |
+| `browser_job_status` | 查询后台浏览器任务状态和下载字节进度。 |
 | `browser_inspect` | 清洗结果不足时，返回有限的文本或 HTML 调试信息。 |
 
 `browser_read` 通过一个工具提供多个层次，不额外增加大量专用工具：
@@ -110,10 +111,11 @@ git pull --ff-only
 
 ## 下载语义
 
-默认情况下，`browser_download` 保持站点和浏览器的正常行为。Edge 对 inline
-PDF 可能打开在线预览，而不是保存文件；文件若被浏览器判定为下载，则进入
-浏览器配置的默认下载目录。工具返回 `completed` 只表示下载入口已触发，
-不表示文件已经完成，也不返回最终路径。
+`browser_download` 会立即返回后台 `jobId`，不会等待大文件完成。用
+`browser_job_status` 查询 `queued`、`claimed`、`completed` 或 `error`，强制下载
+模式还会返回已接收字节数和总字节数（服务器未提供长度时为 `null`）。默认模式
+仍保持站点和浏览器行为；文件若被浏览器判定为下载，则进入浏览器配置的默认下载目录，
+工具无法报告最终文件系统路径。
 
 对于同源且会被 inline 预览的直接文件 URL，可以使用：
 

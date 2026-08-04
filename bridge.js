@@ -103,6 +103,7 @@ function publicJob(job) {
     createdAt: job.createdAt,
     claimedAt: job.claimedAt || null,
     completedAt: job.completedAt || null,
+    progress: job.progress || null,
     clientId: job.clientId || null,
     result: job.result || null,
     error: job.error || null,
@@ -136,7 +137,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/poll') {
       const body = await parseBody(request);
       if (typeof body.clientId !== 'string' || body.clientId.length > 128) throw new Error('clientId is required');
-      state.clients[body.clientId] = { ...body.client, lastSeenAt: new Date().toISOString() };
+      state.clients[body.clientId] = { ...body.client, busy: body.busy === true, lastSeenAt: new Date().toISOString() };
       // Recover jobs claimed by a tab that stopped polling (closed/navigated):
       // no point keeping them in 'claimed' forever where no one can pick them up.
       const now = new Date().getTime();
@@ -150,7 +151,7 @@ const server = http.createServer(async (request, response) => {
           }
         }
       });
-      const job = state.jobs.find((item) => item.status === 'queued' && (!item.target || item.target === body.clientId));
+      const job = body.busy ? null : state.jobs.find((item) => item.status === 'queued' && (!item.target || item.target === body.clientId));
       if (job) {
         job.status = 'claimed';
         job.clientId = body.clientId;
@@ -167,6 +168,19 @@ const server = http.createServer(async (request, response) => {
       job.completedAt = new Date().toISOString();
       job.result = body.result && typeof body.result === 'object' ? body.result : null;
       job.error = typeof body.error === 'string' ? body.error.slice(0, 2000) : null;
+      return send(response, 200, { job: publicJob(job) });
+    }
+    if (request.method === 'POST' && url.pathname === '/progress') {
+      const body = await parseBody(request);
+      const job = state.jobs.find((item) => item.id === body.jobId);
+      if (!job) return send(response, 404, { error: 'Unknown job' });
+      if (job.clientId !== body.clientId) return send(response, 409, { error: 'Job belongs to another tab' });
+      job.progress = {
+        receivedBytes: Number.isFinite(body.receivedBytes) ? body.receivedBytes : 0,
+        totalBytes: Number.isFinite(body.totalBytes) ? body.totalBytes : null,
+        phase: typeof body.phase === 'string' ? body.phase : 'downloading',
+        updatedAt: new Date().toISOString(),
+      };
       return send(response, 200, { job: publicJob(job) });
     }
     return send(response, 404, { error: 'Not found' });

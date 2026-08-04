@@ -66,9 +66,11 @@ async function tabs() {
 }
 
 // Operations that involve a full page load need longer than a quick extract.
-const timeoutFor = (type) => (type === 'navigate' || type === 'download'
-  ? Number(process.env.TPMONKEY_MCP_NAV_TIMEOUT_MS || 60000)
-  : defaultTimeoutMs);
+const timeoutFor = (type) => {
+  if (type === 'download') return Number(process.env.TPMONKEY_MCP_DOWNLOAD_TIMEOUT_MS || 180000);
+  if (type === 'navigate') return Number(process.env.TPMONKEY_MCP_NAV_TIMEOUT_MS || 60000);
+  return defaultTimeoutMs;
+};
 
 async function enqueue(type, payload) {
   await ensureBridge();
@@ -91,6 +93,21 @@ async function enqueue(type, payload) {
   throw new Error(`Browser tab did not complete the action within ${timeoutFor(type) / 1000}s (job ${queued.job.id}, last status: ${lastStatus})`);
 }
 
+async function enqueueBackground(type, payload) {
+  await ensureBridge();
+  if (!payload.tabId) throw new Error('tabId is required. Call browser_tabs first and choose the dedicated tab.');
+  const queued = await request('POST', '/jobs', { type, payload, target: payload.tabId });
+  return queued.job;
+}
+
+async function jobStatus(jobId) {
+  await ensureBridge();
+  const response = await request('GET', '/jobs');
+  const job = response.jobs.find((item) => item.id === jobId);
+  if (!job) throw new Error('Unknown jobId');
+  return job;
+}
+
 function compactJob(job, extra = {}) {
   return { jobId: job.id, status: job.status, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...extra };
 }
@@ -99,7 +116,8 @@ const tools = [
   { name: 'browser_tabs', description: 'List explicitly enabled dedicated browser tabs.', inputSchema: { type: 'object', properties: {} } },
   { name: 'browser_read', description: 'Read a cleaned, layered view of one tab. Use inspect only when this is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['summary', 'text', 'elements', 'links', 'controls', 'media'] }, selector: { type: 'string' }, contains: { type: 'string' }, visible: { type: 'boolean' }, limit: { type: 'number' }, offset: { type: 'number' } }, required: ['tabId'] } },
   { name: 'browser_action', description: 'Navigate, click, or fill one dedicated tab.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['navigate', 'click', 'fill'] }, url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' } }, required: ['tabId', 'action'] } },
-  { name: 'browser_download', description: 'Use the normal browser session to follow a URL or click a download control. Set force for same-origin inline files such as PDFs.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_download', description: 'Start a browser download job. Returns immediately with a jobId; use browser_job_status to monitor progress.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_job_status', description: 'Get status and byte progress for a background browser job.', inputSchema: { type: 'object', properties: { jobId: { type: 'string' } }, required: ['jobId'] } },
   { name: 'browser_inspect', description: 'Debug-only bounded fallback. Request limited plain text or HTML only when browser_read is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['text', 'html'] }, limit: { type: 'number' } }, required: ['tabId'] } },
 ];
 
@@ -117,7 +135,8 @@ async function callTool(name, args = {}) {
     if (!['navigate', 'click', 'fill'].includes(args.action)) throw new Error('action must be navigate, click, or fill');
     return compactJob(await enqueue(args.action, args));
   }
-  if (name === 'browser_download') return compactJob(await enqueue('download', args));
+  if (name === 'browser_download') return compactJob(await enqueueBackground('download', args));
+  if (name === 'browser_job_status') return compactJob(await jobStatus(args.jobId));
   if (name === 'browser_inspect') return compactJob(await enqueue('inspect', { ...args, mode: args.mode || 'text', limit: args.limit || 4000 }));
   throw new Error('Unknown tool');
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.4.0
+// @version      0.6.0
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -14,9 +14,24 @@
 (() => {
   'use strict';
   const bridge = 'http://127.0.0.1:18475';
-  const clientId = sessionStorage.getItem('tm-browser-mcp-client') || crypto.randomUUID();
-  sessionStorage.setItem('tm-browser-mcp-client', clientId);
-  let enabled = sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  const tabStatePrefix = 'tabbridge-mcp:';
+  function readTabState() {
+    if (!window.name.startsWith(tabStatePrefix)) return null;
+    try { return JSON.parse(window.name.slice(tabStatePrefix.length)); } catch { return null; }
+  }
+  function writeTabState(state) {
+    window.name = `${tabStatePrefix}${JSON.stringify(state)}`;
+  }
+  const storedTabState = readTabState();
+  const legacyClientId = sessionStorage.getItem('tm-browser-mcp-client');
+  const clientId = storedTabState?.clientId || legacyClientId || crypto.randomUUID();
+  let enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  let tabState = { ...(storedTabState || {}), clientId, enabled };
+  function updateTabState(patch) {
+    tabState = { ...tabState, ...patch };
+    writeTabState(tabState);
+  }
+  updateTabState({ clientId, enabled });
   let busy = false;
 
   const button = document.createElement('button');
@@ -33,6 +48,7 @@
   button.addEventListener('click', () => {
     enabled = !enabled;
     sessionStorage.setItem('tm-browser-mcp-enabled', String(enabled));
+    updateTabState({ enabled });
     paint();
   });
   mountButton();
@@ -152,12 +168,35 @@
     const name = String(value || '').trim().replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180);
     return name || fallback;
   }
-  async function forceDownload(url, filename) {
+  async function reportProgress(jobId, receivedBytes, totalBytes, phase = 'downloading') {
+    try {
+      await api('POST', '/progress', { jobId, clientId, receivedBytes, totalBytes, phase });
+    } catch { /* Progress reporting must not interrupt the browser download. */ }
+  }
+  async function forceDownload(url, filename, jobId) {
     const target = new URL(url, location.href);
     if (target.origin !== location.origin) return { fallbackTo: target.href };
     const response = await fetch(target.href, { credentials: 'include' });
     if (!response.ok) throw new Error(`Download request failed: HTTP ${response.status}`);
-    const blob = await response.blob();
+    const totalBytes = Number(response.headers.get('content-length')) || null;
+    const chunks = [];
+    let receivedBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      await reportProgress(jobId, 0, totalBytes, 'downloading');
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        chunks.push(part.value);
+        receivedBytes += part.value.byteLength;
+        await reportProgress(jobId, receivedBytes, totalBytes);
+      }
+    } else {
+      const blob = await response.blob();
+      chunks.push(blob);
+      receivedBytes = blob.size;
+    }
+    const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
     const fallback = safeFilename(decodeURIComponent(target.pathname.split('/').pop() || ''), 'download');
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -171,7 +210,18 @@
     return { downloadTriggered: true, downloadMode: 'forced', url: target.href, bytes: blob.size, filename: link.download };
   }
   function activeJob() {
+    if (tabState.activeJob) return tabState.activeJob;
     try { return JSON.parse(sessionStorage.getItem('tm-browser-mcp-active-job')); } catch { return null; }
+  }
+  function setActiveJob(value) {
+    updateTabState({ activeJob: value });
+    sessionStorage.setItem('tm-browser-mcp-active-job', JSON.stringify(value));
+  }
+  function clearActiveJob() {
+    const { activeJob: _, ...rest } = tabState;
+    tabState = rest;
+    writeTabState(tabState);
+    sessionStorage.removeItem('tm-browser-mcp-active-job');
   }
   async function execute(job, phase) {
     const payload = job.payload || {};
@@ -186,7 +236,7 @@
     if (job.type === 'fill') { fill(payload.selector, String(payload.value ?? '')); return { result: pageState() }; }
     if (job.type === 'click') {
       if (phase !== 'afterClick') {
-        sessionStorage.setItem('tm-browser-mcp-active-job', JSON.stringify({ job, phase: 'afterClick' }));
+        setActiveJob({ job, phase: 'afterClick' });
         click(payload.selector);
       }
       await wait(500);
@@ -196,7 +246,7 @@
       if (payload.url) {
         const target = new URL(payload.url, location.href).href;
         if (payload.force) {
-          const forced = await forceDownload(target, payload.filename);
+          const forced = await forceDownload(target, payload.filename, job.id);
           if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
           return { result: forced };
         }
@@ -212,18 +262,18 @@
     try {
       const action = await execute(job, phase);
       if (action.navigateTo) {
-        sessionStorage.setItem('tm-browser-mcp-active-job', JSON.stringify({ job, phase: 'afterNavigate' }));
+        setActiveJob({ job, phase: 'afterNavigate' });
         location.assign(action.navigateTo);
         return;
       }
       const result = action.result || {};
       await api('POST', '/result', { jobId: job.id, clientId, status: result.attentionRequired ? 'blocked' : 'completed', result });
-      sessionStorage.removeItem('tm-browser-mcp-active-job');
+      clearActiveJob();
       if (action.downloadTo) navigate(action.downloadTo);
       if (action.clickAfter) click(action.clickAfter);
     } catch (error) {
       await api('POST', '/result', { jobId: job.id, clientId, status: 'error', error: error.message });
-      sessionStorage.removeItem('tm-browser-mcp-active-job');
+      clearActiveJob();
     } finally {
       busy = false;
       paint();
@@ -231,10 +281,10 @@
   }
   async function poll() {
     mountButton();
-    if (!enabled || busy) return;
+    if (!enabled) return;
     try {
-      const response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title } });
-      if (response.job) await run(response.job);
+      const response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy });
+      if (!busy && response.job) await run(response.job);
     } catch { paint('bridge offline'); }
   }
   setInterval(poll, 1200);
