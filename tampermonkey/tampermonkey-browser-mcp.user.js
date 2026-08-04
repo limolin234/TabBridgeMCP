@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.5
+// @version      0.7.8
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -26,7 +26,13 @@
   const storedTabState = readTabState();
   const legacyClientId = sessionStorage.getItem('tm-browser-mcp-client');
   const clientId = storedTabState?.clientId || legacyClientId || crypto.randomUUID();
-  let enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
+  // enabled is PER-TAB and defaults to off. It is recovered from window.name
+  // (which survives cross-origin navigation in the same tab) with
+  // sessionStorage as a same-origin fallback. A NEW tab has no window.name and
+  // no sessionStorage entry, so it starts off — the GM-setValue experiment
+  // (v0.7.6) wrongly made every new tab enabled because GM storage is global,
+  // not per-tab.
+  const enabled = storedTabState ? storedTabState.enabled === true : sessionStorage.getItem('tm-browser-mcp-enabled') === 'true';
   let tabState = { ...(storedTabState || {}), clientId, enabled };
   function updateTabState(patch) {
     tabState = { ...tabState, ...patch };
@@ -51,6 +57,10 @@
     sessionStorage.setItem('tm-browser-mcp-enabled', String(enabled));
     updateTabState({ enabled });
     paint();
+    // Kick the poll loop immediately so an enable takes effect now, not at the
+    // next idle tick (up to 1200ms later). Without this, clicking the button on
+    // a fresh tab felt like "no reaction" because polling stayed idle.
+    if (enabled) schedulePoll();
   });
   mountButton();
   document.addEventListener('DOMContentLoaded', mountButton, { once: true });
@@ -397,33 +407,45 @@
       busy = false;
       paint();
       // Always resume the poll loop after a job. During a navigation the
-      // pre-scheduled setTimeout(poll) is torn down with the page, so this
-      // finally — and the new page's boot path — restart the loop.
+      // pre-scheduled poll is torn down with the page, so this finally — and
+      // the new page's boot path — restart the loop.
       pollDelay = 60;
-      setTimeout(poll, pollDelay);
+      schedulePoll();
     }
   }
   let pollDelay = 1200;
+  let pollTimer = null;
+  let polling = false;
+  function schedulePoll() {
+    if (pollTimer) return; // already scheduled
+    pollTimer = setTimeout(() => { pollTimer = null; poll(); }, pollDelay);
+    if (pollTimer.unref) pollTimer.unref();
+  }
   async function poll() {
-    mountButton();
-    if (!enabled) { pollDelay = 1200; setTimeout(poll, pollDelay); return; }
-    let response;
-    try { response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy }); }
-    catch { paint('bridge offline'); pollDelay = 1200; setTimeout(poll, pollDelay); return; }
-    if (response.job && !busy) {
-      // run()'s finally always reschedules poll(); do not double-schedule here,
-      // otherwise two poll loops fight. Long jobs still get heartbeats because
-      // run() posts /poll{busy:true} only on demand — see run().
-      run(response.job);
-    } else {
-      pollDelay = response.pending > 0 ? 150 : 1200;
-      setTimeout(poll, pollDelay);
+    if (polling) return; // re-entry guard
+    polling = true;
+    try {
+      mountButton();
+      if (!enabled) { pollDelay = 1200; return; }
+      let response;
+      try { response = await api('POST', '/poll', { clientId, client: { url: location.href, title: document.title }, busy }); }
+      catch { paint('bridge offline'); pollDelay = 1200; return; }
+      if (response.job && !busy) {
+        // run()'s finally always calls schedulePoll(); do not schedule here.
+        run(response.job);
+      } else {
+        pollDelay = response.pending > 0 ? 150 : 1200;
+      }
+    } finally {
+      polling = false;
+      // Re-schedule unless a job is being handled (run() will schedule).
+      if (!busy) schedulePoll();
     }
   }
   setTimeout(() => {
     const active = activeJob();
     if (enabled && active?.job) run(active.job, active.phase);
-    else poll();
+    else schedulePoll();
   }, 500);
   // -- Consent-overlay / page-stall resilience (v0.7.5) ---------------------
   // WHY THIS EXISTS: some sites (ACM Digital Library, Stack Overflow, others)
@@ -447,7 +469,7 @@
   // is genuinely frozen (the timer itself can't fire). Event-driven re-arming
   // is the right recovery; the steady-state interval stays low.
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) poll();
+    if (!document.hidden) schedulePoll();
   });
-  window.addEventListener('pageshow', poll);
+  window.addEventListener('pageshow', schedulePoll);
 })();
