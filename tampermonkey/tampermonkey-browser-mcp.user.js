@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.13
+// @version      0.7.14
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -329,22 +329,21 @@
     if (job.type === 'download') {
       if (payload.url) {
         const target = new URL(payload.url, location.href).href;
-        // Default to a forced download: browsers preview PDFs inline by default,
-        // so a plain navigation would open the viewer instead of saving the
-        // file. Prefer GM_download — it is browser-level, works cross-origin,
-        // and saveAs:false writes the file directly (bypassing the inline
-        // viewer). forceDownload (fetch→blob) only works same-origin, so use it
-        // as the fallback. Pass preview:true to opt into the browser's own
-        // inline-view / default behavior instead.
+        // Same-origin downloads prefer fetch (forceDownload): it carries the
+        // page's full session cookie, Referer, and browser fingerprint —
+        // closest to a real user click. Publisher bot management (IEEE
+        // stamp.jsp) returns a JS challenge to GM_download's downloader
+        // request but serves the real PDF to a page-context fetch. Pass
+        // preview:true to opt into the browser's inline-view behavior.
         if (payload.preview) {
           return { result: { downloadTriggered: true, downloadMode: 'preview', url: target }, downloadTo: target };
         }
-        if (typeof GM_download === 'function') return { result: await gmDownload(target, payload.filename, job.id) };
-        if (payload.force || new URL(target).origin === location.origin) {
+        if (new URL(target).origin === location.origin) {
           const forced = await forceDownload(target, payload.filename, job.id);
           if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
           return { result: forced };
         }
+        if (typeof GM_download === 'function') return { result: await gmDownload(target, payload.filename, job.id) };
         return { result: { downloadTriggered: true, downloadMode: 'browser', url: target }, downloadTo: target };
       }
       return { result: { downloadTriggered: true, ...pageState() }, clickAfter: payload.selector };
