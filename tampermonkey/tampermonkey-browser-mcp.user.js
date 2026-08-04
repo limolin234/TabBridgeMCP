@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.14
+// @version      0.7.15
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -238,6 +238,21 @@
     const name = String(value || '').trim().replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180);
     return name || fallback;
   }
+  // Derive a useful filename from a download URL: IEEE stamp.jsp?arnumber=…
+  // and /document/123 patterns map to "<id>.pdf", plain paths keep their last
+  // segment, everything else falls back to 'download'.
+  function filenameFromUrl(value) {
+    try {
+      const u = new URL(value, location.href);
+      const arnumber = u.searchParams.get('arnumber');
+      if (arnumber) return `${arnumber}.pdf`;
+      const m = u.pathname.match(/(\d+)\/?$/);
+      if (m) return `${m[1]}.pdf`;
+      const last = decodeURIComponent(u.pathname.split('/').pop() || '');
+      if (last && /\.\w{2,5}$/.test(last)) return last;
+      return 'download';
+    } catch { return 'download'; }
+  }
   async function reportProgress(jobId, receivedBytes, totalBytes, phase = 'downloading') {
     try {
       await api('POST', '/progress', { jobId, clientId, receivedBytes, totalBytes, phase });
@@ -293,6 +308,25 @@
       });
     });
   }
+  // Browser-native forced save: a same-origin <a download> click issues a real
+  // navigation-style request (full browser fingerprint, current Referer) that
+  // publisher bot management lets through, while the download attribute forces
+  // a save instead of the inline PDF viewer. This is the only path that
+  // downloads IEEE stamp.jsp behind its APM bot check — GM_download and fetch
+  // both get a JS challenge page. Cross-origin targets ignore the download
+  // attribute, so native mode is same-origin only.
+  function nativeDownload(url, filename) {
+    const target = new URL(url, location.href);
+    if (target.origin !== location.origin) return { fallbackTo: target.href };
+    const link = document.createElement('a');
+    link.href = target.href;
+    link.download = safeFilename(filename, filenameFromUrl(url));
+    link.style.display = 'none';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    return { downloadTriggered: true, downloadMode: 'native', url: target.href, filename: link.download };
+  }
   function activeJob() {
     if (tabState.activeJob) return tabState.activeJob;
     try { return JSON.parse(sessionStorage.getItem('tm-browser-mcp-active-job')); } catch { return null; }
@@ -329,19 +363,24 @@
     if (job.type === 'download') {
       if (payload.url) {
         const target = new URL(payload.url, location.href).href;
-        // Same-origin downloads prefer fetch (forceDownload): it carries the
-        // page's full session cookie, Referer, and browser fingerprint —
-        // closest to a real user click. Publisher bot management (IEEE
-        // stamp.jsp) returns a JS challenge to GM_download's downloader
-        // request but serves the real PDF to a page-context fetch. Pass
-        // preview:true to opt into the browser's inline-view behavior.
+        // Same-origin downloads prefer browser-native save (nativeDownload):
+        // a real <a download> navigation request carries the full browser
+        // fingerprint + current Referer, so publisher bot management (IEEE
+        // APM) serves the real PDF instead of the JS challenge it returns to
+        // GM_download/fetch. fetch (forceDownload) is the fallback — also
+        // same-origin session-carrying but a script request. GM_download
+        // remains the cross-origin path. preview:true opts into inline view.
         if (payload.preview) {
           return { result: { downloadTriggered: true, downloadMode: 'preview', url: target }, downloadTo: target };
         }
         if (new URL(target).origin === location.origin) {
-          const forced = await forceDownload(target, payload.filename, job.id);
-          if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
-          return { result: forced };
+          const native = nativeDownload(target, payload.filename);
+          if (native.fallbackTo) {
+            const forced = await forceDownload(target, payload.filename, job.id);
+            if (forced.fallbackTo) return { result: { downloadTriggered: true, downloadMode: 'browser', url: forced.fallbackTo }, downloadTo: forced.fallbackTo };
+            return { result: forced };
+          }
+          return { result: native };
         }
         if (typeof GM_download === 'function') return { result: await gmDownload(target, payload.filename, job.id) };
         return { result: { downloadTriggered: true, downloadMode: 'browser', url: target }, downloadTo: target };
