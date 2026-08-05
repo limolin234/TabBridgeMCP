@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      0.7.15
+// @version      0.7.16
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -258,12 +258,30 @@
       await api('POST', '/progress', { jobId, clientId, receivedBytes, totalBytes, phase });
     } catch { /* Progress reporting must not interrupt the browser download. */ }
   }
+  // Detect a bot-management / paywall response masquerading as a download.
+  // Publishers serve an HTML/JS challenge (IEEE APM_DO_NOT_TOUCH, Cloudflare
+  // "Just a moment", reCAPTCHA) to script-initiated downloads even when the
+  // browser session is valid. Saving that HTML would silently write garbage —
+  // fail loudly instead so the caller routes to real sign-in / manual access.
+  async function challengeFrom(blob, contentType, url) {
+    if (!/text\/html|application\/javascript|text\/javascript/i.test(contentType || '')) return null;
+    const head = await blob.slice(0, 2000).text();
+    if (/APM_DO_NOT_TOUCH|Just a moment|cf-browser|challenge-platform|g-recaptcha|hcaptcha|verify|puzzle/i.test(head)) {
+      return { reason: 'bot-check', detail: (head.match(/\S{3,40}/g) || []).slice(0, 4).join(' ') };
+    }
+    // A download URL that returns HTML it was not asked to download is a wall.
+    if (/\.(pdf|zip|docx?|xlsx?|tar|gz)\b/i.test(url) && /<html|<head|<body/i.test(head)) {
+      return { reason: 'not-a-file', detail: contentType };
+    }
+    return null;
+  }
   async function forceDownload(url, filename, jobId) {
     const target = new URL(url, location.href);
     if (target.origin !== location.origin) return { fallbackTo: target.href };
     const response = await fetch(target.href, { credentials: 'include' });
     if (!response.ok) throw new Error(`Download request failed: HTTP ${response.status}`);
     const totalBytes = Number(response.headers.get('content-length')) || null;
+    const contentType = response.headers.get('content-type') || '';
     const chunks = [];
     let receivedBytes = 0;
     if (response.body) {
@@ -281,7 +299,9 @@
       chunks.push(blob);
       receivedBytes = blob.size;
     }
-    const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
+    const blob = new Blob(chunks, { type: contentType || 'application/octet-stream' });
+    const wall = await challengeFrom(blob, contentType, target.href);
+    if (wall) throw new Error(`Download blocked (${wall.reason}): ${wall.detail || 'challenge page'}`);
     const fallback = safeFilename(decodeURIComponent(target.pathname.split('/').pop() || ''), 'download');
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
