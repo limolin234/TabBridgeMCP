@@ -112,7 +112,11 @@ function CSS_escape(value) {
 // affordances. Derived purely from physical/static facts (no JS).
 const SPECIAL_KEYWORDS = /\b(submit|search|login|sign\s*-?\s*(in|on)|register|confirm|apply|buy|checkout|add\s*to\s*cart|accept|agree|确定|提交|搜索|登录|注册|确认|接受|同意|购买|结算|加入购物车)\b/i;
 const SPECIAL_HREF = /\/?(login|signin|register|cart|checkout|search|logout|signout)/i;
-const SPECIAL_CLASS = /\b(primary|submit|search|login|register|cta|accept|agree|confirm|main-|nav-|menu-)/i;
+// nav- / menu- classes are NOT special: they name navigation chrome, which the
+// attention model demotes (hasChromeAncestor). Real actions in a nav — a
+// "Sign in" link (href), a search box (class search / type text) — still
+// promote through the other special channels.
+const SPECIAL_CLASS = /\b(primary|submit|search|login|register|cta|accept|agree|confirm|main-)/i;
 function isSpecial(el) {
   if (!el) return { isSpecial: false, hints: [] };
   const hints = [];
@@ -139,11 +143,66 @@ const NOISE_SELECTOR = [
   'CybotCookiebotDialog',       // Cookiebot — trademark token, no word boundary
   'osano-cm',                  // Osano consent
   'onetrust',                  // OneTrust consent
+  'didomi',                    // Didomi consent
+  'sp_message',                // Sourcepoint consent
+  'qc-cmp',                    // Quantcast Choice consent
+  'cookie-consent',            // generic cookie banner (common id/class)
+  'consent-banner',
+  'privacy-banner',
+  'cc-banner',                 // Cookie Consent banner
+  'cookieChoiceInfo',          // EU cookie law banner
+  'ot-sdk',                    // OneTrust SDK containers
 ].join('|');
 const NOISE_TOKEN_RE = new RegExp(NOISE_SELECTOR, 'i');
 const NOISE_WORD_RE = new RegExp(`(^|[^a-z])(cookie|consent|gdpr|modal|dialog|popover|close-modal|bp-modal|visually-hidden|sr-only|skip-link|cookie-banner)([^a-z]|$)`, 'i');
-const NOISE_TEXT_RE = /(allow all cookies|accept all cookies|use necessary cookies|manage consent|cookie settings|consent|cookie preferences|privacy settings)/i;
+// Banner copy. Phrases, not single words: "consent" alone stays in NOISE_WORD_RE
+// (id/class context) but a page may legitimately say "consent" in body text.
+const NOISE_TEXT_RE = /(allow all cookies|accept all cookies|accept all|use necessary cookies|essential cookies|reject all|reject non-essential|manage consent|cookie settings|consent preferences|cookie preferences|privacy settings|privacy choice|your privacy, your choice|your privacy choices|we value your privacy|我们使用.*?cookie|为了改善您的体验|接受所有.*?cookie|全部接受|拒绝全部|同意并继续|同意并进入|我知道了|仅必要)/i;
 const NOISE_CLOSE_RE = /^[×x✕✖]|close( modal| dialog| menu)?$/i;
+
+// Clean extracted control text: some sites leak code-looking fragments into
+// control labels (Google renders a hidden element whose text is the CSS rule
+// ".O35uA{width:28px…}"; script/HTML remnants can survive into textContent).
+// None of these are meaningful labels, so strip them here — before salience,
+// special-detection, and mark-matching all read item.text.
+const STRAY_TAG_RE = /<\/?(?:script|style|template|noscript)[^>]*>|<\/?[a-z][^>]*>/gi;
+const CSS_RULE_FRAG_RE = /(?:^|\s)[.#][\w-]+\s*\{[^}]*\}/g;
+function cleanText(value) {
+  let s = String(value || '');
+  const t = s.trim();
+  if (/^[.#][\w-]*\s*\{[^}]*\}$/.test(t)) return '';        // lone CSS rule = pure style noise
+  if (/^<\/(?:script|style|template)>$/i.test(t)) return '';
+  s = s.replace(STRAY_TAG_RE, ' ');
+  s = s.replace(CSS_RULE_FRAG_RE, ' ');
+  return s.replace(/\s+/g, ' ').trim();
+}
+// True when the text really is code (a CSS rule, a JS fragment) that landed on
+// a control. Such elements are useless to the AI, so they are hidden outright.
+function looksLikeCode(value) {
+  const s = String(value || '').trim();
+  if (!s || s.length < 6) return false;
+  if (/^[.#][\w-]+\s*\{[\s\S]*\}\s*$/.test(s)) return true;                    // .cls{...} / #id{...}
+  if (/<\/(?:script|style|template)>/i.test(s)) return true;                   // script/style remnant
+  if (/^(?:var|let|const|function|return|if|for|while|window\.|document\.|console\.)\b/i.test(s)) return true; // js statement remnant
+  if (/\{\s*["']?[^:{};]+["']?\s*[:;]/.test(s) && /\}[;\s]*$/.test(s) && s.length < 400) return true; // js object/rule
+  return false;
+}
+
+// Is the element inside navigation/footer chrome? The userscript's flattened
+// path walks from the element up 8 ancestors, so a nav/footer tag anywhere in
+// the chain marks site chrome. Chrome must stay reachable (secondary/grouped —
+// a nav cluster, a footer link row) but must not claim primary attention; its
+// score is capped below the primary band. Header is deliberately NOT chrome:
+// search boxes and primary site nav live there and ARE the action a user
+// reaches for, and special/input promotion above the cap keeps them primary.
+function hasChromeAncestor(path) {
+  if (!Array.isArray(path)) return false;
+  for (const part of path) {
+    const tag = part && part.tag;
+    if (tag === 'nav' || tag === 'footer') return true;
+  }
+  return false;
+}
 
 function isNoise(item) {
   if (!item) return false;
@@ -189,6 +248,7 @@ function salience(item, viewport) {
   const textness = meaningful ? Math.min(0.08 * Math.log1p(Math.max(text.length, label.length)), 1) : 0;
   let score = 100 * (0.22 * size + 0.18 * position + 0.18 * kind + 0.14 * special + 0.28 * textness);
   if (!item.inViewport) score = Math.min(score, 5); // off-screen never primary
+  if (item._chrome) score = Math.min(score, 45);    // nav/footer chrome: reachable, never primary
   return Math.round(score);
 }
 
@@ -534,7 +594,7 @@ function assignZones(items, options = {}) {
   const meaningful = (it) => String(it.text || '').trim().length >= 2 && !/^(on|off|true|false)$/i.test(String(it.text || '').trim());
   const promoted = sortedUngrouped.filter((it) => (it.special || ['input', 'textarea', 'select'].includes(it.kind)) && (meaningful(it) || String(it.ariaLabel || '').length >= 4)).slice(0, 12);
   const promotedKeys = new Set(promoted.map((it) => it._k));
-  const topK = sortedUngrouped.filter((it) => !promotedKeys.has(it._k)).slice(0, k);
+  const topK = sortedUngrouped.filter((it) => !promotedKeys.has(it._k) && !it._chrome).slice(0, k);
   primary.push(...[...promoted, ...topK].slice(0, 8));
 
   // Marked-important elements always land in primary. MANUAL marks are an
@@ -597,13 +657,20 @@ function analyzeInteract(raw, options = {}) {
     const kind = kindOf(el);
     const rect = el.rect;
     const vis = rect && rect.w > 0 && rect.h > 0 && el.isDisplayed !== false;
-    const special = isSpecial(el);
+    const rawText = el.text || '';
+    const text = cleanText(rawText);
+    // Raw text that cleans to nothing (a lone CSS rule, a stray script remnant)
+    // means the control carries only code noise — hide it outright.
+    const textWasAllNoise = text === '' && rawText.trim() !== '';
+    // Special-detection reads the cleaned text too — a code-looking label must
+    // not win a "search/confirm" hint by accident.
+    const special = isSpecial({ ...el, text });
     const item = {
       _k: i,
       rawIndex: i,
       tag: el.tag,
       kind,
-      text: (el.text || '').slice(0, 120),
+      text: text.slice(0, 120),
       href: el.href || null,
       type: el.type || null,
       name: el.name || null,
@@ -620,7 +687,8 @@ function analyzeInteract(raw, options = {}) {
       selector: selectorFromPath(el.path),
       path: el.path,
       special: special.isSpecial,
-      _noise: isNoise({ id: el.id, path: el.path, role: el.role, text: el.text, ariaLabel: el['aria-label'], kind }),
+      _noise: isNoise({ id: el.id, path: el.path, role: el.role, text, ariaLabel: el['aria-label'], kind }) || looksLikeCode(text) || textWasAllNoise,
+      _chrome: hasChromeAncestor(el.path),
       _hidden: !vis,
     };
     item.score = salience(item, viewport);

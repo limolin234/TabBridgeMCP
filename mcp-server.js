@@ -220,7 +220,7 @@ const tools = [
   { name: 'browser_tabs', description: 'List explicitly enabled dedicated browser tabs.', inputSchema: { type: 'object', properties: {} } },
   { name: 'browser_read', description: 'Read a cleaned, layered view of one tab. Use inspect only when this is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['summary', 'text', 'elements', 'links', 'controls', 'media', 'interact'] }, selector: { type: 'string' }, contains: { type: 'string' }, visible: { type: 'boolean' }, limit: { type: 'number' }, offset: { type: 'number' }, expand: { type: 'string' } }, required: ['tabId'] } },
   { name: 'browser_action', description: 'Navigate, click, or fill a selected tab. Interact modes also accept index/point/x/y/dx/dy/key.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['navigate', 'click', 'fill', 'scroll', 'focus', 'hover', 'key', 'clickPoint', 'verifyPoint'] }, url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' }, index: { type: 'number' }, point: { type: 'object' }, x: { type: 'number' }, y: { type: 'number' }, dx: { type: 'number' }, dy: { type: 'number' }, key: { type: 'string' }, code: { type: 'string' } }, required: ['tabId', 'action'] } },
-  { name: 'browser_download', description: 'Download a file. Browsers preview PDFs inline by default, so downloads default to a forced save (bypasses the inline viewer) unless preview:true opts into the browser inline view. Returns immediately with a jobId; use browser_job_status to monitor progress.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, preview: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
+  { name: 'browser_download', description: 'Download a file. HTML wrapper pages (IEEE stamp.jsp) auto-resolve to the real PDF URL, load it in the tab, and fetch it from that warm context. preview:true opts into the browser inline view; force:true opts into a same-origin fetch->blob save; otherwise the tab navigates to the URL and the browser saves it. Returns immediately with a jobId; use browser_job_status to monitor progress.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, url: { type: 'string' }, selector: { type: 'string' }, force: { type: 'boolean' }, preview: { type: 'boolean' }, filename: { type: 'string' } }, required: ['tabId'] } },
   { name: 'browser_job_status', description: 'Get status and byte progress for a background browser job.', inputSchema: { type: 'object', properties: { jobId: { type: 'string' } }, required: ['jobId'] } },
   { name: 'browser_inspect', description: 'Debug-only bounded fallback. Request limited plain text or HTML only when browser_read is insufficient.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, mode: { type: 'string', enum: ['text', 'html'] }, limit: { type: 'number' } }, required: ['tabId'] } },
   { name: 'browser_mark', description: 'Mark an interact element important/unimportant for the current page domain (site memory), or list/clear current marks. index = position from the latest browser_read interact snapshot; selector is the offline-capable alternative.', inputSchema: { type: 'object', properties: { tabId: { type: 'string' }, action: { type: 'string', enum: ['important', 'unimportant', 'list', 'clear'] }, index: { type: 'number' }, selector: { type: 'string' } }, required: ['tabId', 'action'] } },
@@ -304,10 +304,68 @@ async function callTool(name, args = {}) {
     }
     throw new Error(`unknown browser_mark action ${args.action}`);
   }
-  if (name === 'browser_download') return compactJob(await enqueueBackground('download', args));
+  if (name === 'browser_download') return compactJob(await enqueueBackground('download', await resolveDownloadArgs(args)));
   if (name === 'browser_job_status') return compactJob(await jobStatus(args.jobId));
   if (name === 'browser_inspect') return compactJob(await enqueue('inspect', { ...args, mode: args.mode || 'text', limit: args.limit || 4000 }));
   throw new Error('Unknown tool');
+}
+
+// Some publishers serve a PDF through an HTML wrapper page that embeds the
+// real file in an <iframe> (IEEE stamp.jsp → stampPDF/getPDF.jsp). Downloading
+// the wrapper URL saves the HTML, not the PDF. For known wrappers we CONSTRUCT
+// the real file URL from the wrapper's own parameters — no page parsing needed.
+// (An earlier navigate→inspect approach proved unreliable: navigating a
+// PDF-viewer tab can leave it stuck busy, and inspect returns an empty DOM
+// inside the viewer. Construction is deterministic and verified against IEEE.)
+const WRAPPER_BUILDERS = [
+  {
+    // stamp.jsp is the wrapper; stampPDF/getPDF.jsp is the real file. Both are
+    // IEEE-specific and both need the navigate-then-fetch warm path below.
+    test: /stamp\.jsp|stampPDF\/getPDF\.jsp/i,
+    build(u) {
+      const arnumber = u.searchParams.get('arnumber');
+      if (!arnumber) return null;
+      // getPDF.jsp requires ref=base64(abstract page URL); without it IEEE
+      // serves no file. The abstract URL is derivable from the arnumber.
+      const ref = Buffer.from(`https://ieeexplore.ieee.org/abstract/document/${arnumber}`).toString('base64');
+      return `https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=${arnumber}&ref=${ref}`;
+    },
+  },
+];
+// IEEE's APM rejects script-initiated fetches from an ordinary page but serves
+// the real file once the tab has loaded it (a top-level navigation from the
+// article page — same-site referrer — warms the session and its own IEEE
+// viewer page keeps the userscript alive). So the resolved download FIRST
+// navigates the tab to the real PDF URL, then dispatches a same-origin forced
+// fetch from that warm context. If the navigation is bounced back to the
+// article page, the session lacks access — fail with a clear sign-in error
+// instead of saving an APM challenge page.
+async function resolveDownloadArgs(args) {
+  if (!args.url) return args;
+  const u = new URL(args.url);
+  if (u.hostname !== 'ieeexplore.ieee.org') return args;
+  const builder = WRAPPER_BUILDERS.find((w) => w.test.test(u.pathname));
+  if (!builder) return args;
+  const real = builder.build(u);
+  if (!real) return args;
+  const tab = (await tabs()).find((item) => item.id === args.tabId);
+  if (!tab) throw new Error('Unknown tabId. Call browser_tabs again.');
+  const nav = await enqueue('navigate', { tabId: args.tabId, url: real });
+  const landed = nav.result && nav.result.url;
+  if (landed && new URL(landed).pathname !== new URL(real).pathname) {
+    throw new Error('IEEE redirected the PDF page back to the article — an active institutional sign-in is required to download this paper. Route through the IEEE institutional sign-in flow first.');
+  }
+  return { ...args, url: real, force: true, filename: args.filename || filenameFromUrl(real) };
+}
+function filenameFromUrl(value) {
+  try {
+    const u = new URL(value);
+    const arnumber = u.searchParams.get('arnumber');
+    if (arnumber) return `${arnumber}.pdf`;
+    const last = decodeURIComponent(u.pathname.split('/').pop() || '');
+    if (last && /\.\w{2,5}$/.test(last)) return last;
+    return 'download.pdf';
+  } catch { return 'download.pdf'; }
 }
 
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
