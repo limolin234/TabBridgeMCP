@@ -11,9 +11,20 @@ const PRESETS = [
     domain: 'ieeexplore.ieee.org',
     marks: [
       { match: { text: /pdf/i, href: /\/document\/|\/stamp\// }, label: 'PDF Download', kind: 'important' },
+      { match: { text: /view document/i }, label: 'View Document', kind: 'important' },
       { match: { text: /citation|cite this|export/i }, label: 'Citation / Export', kind: 'important' },
       { match: { text: /save/i }, label: 'Save', kind: 'important' },
       { match: { text: /search/i }, label: 'Search', kind: 'important' },
+      // Sign-in cluster: the access entry points AND the paywall notices form
+      // one "login required" signal — when any of them is present, the paper
+      // is not downloadable without access, and the AI should route to
+      // institutional/personal sign-in instead of attempting a blind download.
+      // They only render when the page actually shows a wall, so promoting
+      // them never wastes attention on an already-authorized paper.
+      { match: { text: /institutional sign in/i }, label: 'Institutional Sign In', kind: 'important' },
+      { match: { text: /personal sign in/i }, label: 'Personal Sign In', kind: 'important' },
+      { match: { text: /sign in or purchase/i }, label: 'Login Required (Sign In or Purchase)', kind: 'important' },
+      { match: { text: /sign in to continue reading/i }, label: 'Login Required (Continue Reading)', kind: 'important' },
     ],
   },
   {

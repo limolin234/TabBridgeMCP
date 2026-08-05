@@ -323,6 +323,14 @@ function applyPreference(item, preference) {
     item.score = PREF_UNIMPORTANT_SCORE;
     return;
   }
+  // Preset 'unimportant' (e.g. IEEE paywall buttons) demotes too — presets are
+  // seeds of the same marks array, not a separate tier, so an unimportant
+  // preset must actually hide its element. Manual marks still beat presets.
+  if (bestPreset && bestPreset.kind === 'unimportant' && !(bestManual && bestManual.kind === 'important')) {
+    item.pref = { important: false, unimportant: true, boost: 0, manual: false };
+    item.score = PREF_UNIMPORTANT_SCORE;
+    return;
+  }
   const boost = clickBoost(preference.clicks, cues);
   if (bestManual && bestManual.kind === 'important') {
     item.pref = { important: true, unimportant: false, boost: 0, manual: true };
