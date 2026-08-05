@@ -182,6 +182,13 @@ const server = http.createServer(async (request, response) => {
         phase: typeof body.phase === 'string' ? body.phase : 'downloading',
         updatedAt: new Date().toISOString(),
       };
+      // A long-running job (a force-download streams progress per chunk) keeps
+      // the claiming tab's /poll silent — the tab is busy and cannot poll. Treat
+      // each progress report as a liveness beat so the /poll recovery never
+      // mistakes a mid-transfer client for a dead one and re-claims the job
+      // (which re-downloads the file, duplicate after duplicate).
+      const client = state.clients[body.clientId] || (state.clients[body.clientId] = {});
+      client.lastSeenAt = new Date().toISOString();
       return send(response, 200, { job: publicJob(job) });
     }
     return send(response, 404, { error: 'Not found' });
