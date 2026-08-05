@@ -151,13 +151,26 @@ keep the site's native click behavior.
 {"tabId":"TAB_ID","url":"https://example.com/paper.pdf","force":true,"filename":"paper.pdf"}
 ```
 
+Some publishers expose a PDF through an HTML wrapper page (IEEE `stamp.jsp`).
+When the requested URL is a known wrapper, the server resolves it to the real
+file URL, loads that file in the tab first (this warms the publisher's access
+check), and fetches it from that warm context. If the access check bounces the
+navigation back, the download fails with an explicit sign-in-required error
+instead of saving a challenge page.
+
 Private adapters can be loaded with `TABBRIDGE_ADAPTERS_DIR`; see
 [`adapters/README.md`](adapters/README.md). This keeps organization-specific
 and site-specific rules outside the public repository.
 
 ## Development
 
-The project has no runtime dependencies. Test the MCP protocol with:
+The project has no runtime dependencies. Run the unit tests with:
+
+```sh
+node --test "tests/*.test.js"
+```
+
+Test the MCP protocol with:
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | node mcp-server.js

@@ -1,7 +1,7 @@
 'use strict';
 
 // Unit tests for the analyzer's cleaning layer: code-text filtering, consent/
-// cookie banner noise, and nav/footer chrome demotion. Run: node --test tests/
+// cookie banner noise, and nav/footer chrome demotion. Run: node --test "tests/*.test.js"
 
 const { test } = require('node:test');
 const assert = require('node:assert');

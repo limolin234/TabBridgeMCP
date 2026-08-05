@@ -1,6 +1,6 @@
 'use strict';
 
-// Unit tests for the site-memory / preference system. Run: node --test tests/
+// Unit tests for the site-memory / preference system. Run: node --test "tests/*.test.js"
 
 const { test } = require('node:test');
 const assert = require('node:assert');
