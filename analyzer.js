@@ -114,11 +114,15 @@ function inViewport(rect, viewport) {
 }
 
 // Build a stable CSS selector from the flattened ancestor path reported by the
-// userscript. Strategy: prefer the shortest robust chain — own id, then own
-// tag+class, then walk up to the nearest ancestor with an id. Unstyled
-// ancestors that carry no distinguishing feature still need an nth-of-type so
-// the chain stays unambiguous; id/class-bearing ancestors stop the climb early
-// to keep the selector short and resilient to re-render.
+// userscript. The path is collected LEAF-first (element, then parent, then
+// grandparent ... up to depth 8), so the segments are REVERSED below: CSS reads
+// ancestor -> descendant, and document.querySelector only resolves the chain
+// when the leftmost segment is an ancestor. Strategy: prefer the shortest
+// robust chain — own id, then own tag+class, then walk up to the nearest
+// ancestor with an id. Unstyled ancestors that carry no distinguishing feature
+// still need an nth-of-type so the chain stays unambiguous; id/class-bearing
+// ancestors stop the climb early to keep the selector short and resilient to
+// re-render.
 function selectorFromPath(path) {
   if (!Array.isArray(path) || path.length === 0) return null;
   const segments = [];
@@ -137,7 +141,9 @@ function selectorFromPath(path) {
     if (part.id || (Array.isArray(part.class) && part.class.length)) break;
     if (climbed >= 5) break;
   }
-  return segments.join(' > ');
+  // path is leaf-first (element, parent, ...); CSS needs ancestor-first, so the
+  // rightmost segment must be the target element itself.
+  return segments.reverse().join(' > ');
 }
 
 function CSS_escape(value) {
