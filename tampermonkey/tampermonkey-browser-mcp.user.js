@@ -464,6 +464,14 @@
     }
     throw new Error(`Unsupported action: ${job.type}`);
   }
+  // A read is only genuinely blocked when a wall (captcha/login prompt) left no
+  // content behind. Pages with a visible sign-in upsell (IEEE "Save Your
+  // Search") still return complete content — those must report 'completed'.
+  function extractEmpty(data) {
+    const values = Object.values(data || {});
+    if (!values.length) return true;
+    return values.every((value) => (Array.isArray(value) ? value.length === 0 : !String(value || '').trim()));
+  }
   async function run(job, phase) {
     busy = true;
     paint();
@@ -475,7 +483,8 @@
         return;
       }
       const result = action.result || {};
-      await api('POST', '/result', { jobId: job.id, clientId, status: result.attentionRequired ? 'blocked' : 'completed', result });
+      const isWall = result.attentionRequired && (job.type !== 'extract' || extractEmpty(result.data));
+      await api('POST', '/result', { jobId: job.id, clientId, status: isWall ? 'blocked' : 'completed', result });
       clearActiveJob();
       if (action.downloadTo) navigate(action.downloadTo);
       if (action.clickAfter) click(action.clickAfter);

@@ -46,4 +46,4 @@
 4. 自适应轮询:完成任务 60ms / 有 pending 150ms / 空闲 1200ms。bridge `/poll` 返回 `pending` 计数。
 5. 未来视觉/截图能力(多模态)落在**本地**,基于油猴已报的 `rect` 坐标作为锚点,不需改油猴。
 6. 已知限制(冻结期内不解决):Shadow DOM 不穿透;纯 CSS `:hover` 菜单不展开;React 受控输入建议用 `clickPoint`+`key` 而非 `fill`。
-7. **例外(v1.0.1/1.0.2)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 改为只对**可见**的密码/验证码元素报 attention(隐藏的登录弹窗如 IEEE "Sign In to Save Your Search" 不再误报 blocked)。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。
+7. **例外(v1.0.1/1.0.2)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 只对**可见**的密码/验证码元素报 attention;且 extract 仅在内容为空时才标 `blocked`(有完整内容即使存在登录弹窗也报 `completed`)——修复 IEEE 搜索页 "Sign In to Save Your Search" 弹窗导致的误报 blocked。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。
