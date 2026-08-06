@@ -12,7 +12,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 
-const { analyzeInteract, verifyItem } = require('../analyzer');
+const { analyzeInteract, verifyItem, selectorFromPath } = require('../analyzer');
 
 // ---- verifyItem -------------------------------------------------------------
 
@@ -125,4 +125,46 @@ test('viewport size drives inViewport (no hardcoded 1920x1080)', () => {
   const short = analyzeInteract([el], { viewport: { w: 1280, h: 900 } });
   assert.strictEqual(tall.items[0].inViewport, true, 'element below a 1080px fold is on a 1080px screen');
   assert.strictEqual(short.items[0].inViewport, false, 'the same rect is off-screen when the real viewport is shorter');
+});
+
+// ---- selectorFromPath ---------------------------------------------------------
+// The userscript reports the flattened ancestor path LEAF-first
+// (element, parent, grandparent, ...). A CSS selector must read ancestor ->
+// descendant, and document.querySelector only resolves the chain when the
+// leftmost segment is an ancestor. Regression: the leaf was emitted leftmost,
+// so off-screen scrolls used a back-to-front selector like
+// "button:nth-of-type(1) > div > div.freshman-task-pending", which never
+// matches the real DOM ("div.freshman-task-pending > div > button:nth-of-type(1)")
+// and the scroll failed with "Element not found".
+
+test('selectorFromPath: class-bearing leaf stays a single segment', () => {
+  const path = [{ tag: 'button', id: null, class: ['freshman-summary-card'], nth: 1 }, { tag: 'body', id: null, class: [], nth: null }];
+  assert.strictEqual(selectorFromPath(path), 'button.freshman-summary-card');
+});
+
+test('selectorFromPath: emits root->leaf (leaf rightmost) when ancestors are needed', () => {
+  // Leaf (the pill button) has no class; its grandparent carries the anchor class.
+  const path = [
+    { tag: 'button', id: null, class: [], nth: 1 },
+    { tag: 'div', id: null, class: [], nth: null },
+    { tag: 'div', id: null, class: ['freshman-task-pending'], nth: 1 },
+  ];
+  assert.strictEqual(
+    selectorFromPath(path),
+    'div.freshman-task-pending > div > button:nth-of-type(1)',
+    'must be back-to-front compared with the old leaf-first output'
+  );
+});
+
+test('selectorFromPath: textarea/section chain also emits root->leaf', () => {
+  const path = [
+    { tag: 'textarea', id: null, class: [], nth: null },
+    { tag: 'section', id: null, class: ['freshman-sms-panel'], nth: 1 },
+  ];
+  assert.strictEqual(selectorFromPath(path), 'section.freshman-sms-panel > textarea');
+});
+
+test('selectorFromPath: empty path returns null', () => {
+  assert.strictEqual(selectorFromPath([]), null);
+  assert.strictEqual(selectorFromPath(null), null);
 });
