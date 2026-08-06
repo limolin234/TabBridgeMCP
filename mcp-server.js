@@ -150,6 +150,35 @@ async function verifyBinding(tab, args, item, pointOverride) {
   return true;
 }
 
+// Off-screen clicks scroll the target into view, then assume its center sits at
+// vp.h/2 (scrollIntoView centers vertically). That projection is imprecise when
+// the page has a nested scroller or a same-pattern sibling lands at center —
+// the recorded element can end up a few tens of px away. Instead of failing the
+// moment the first point mismatches, sweep a small vertical band around the
+// projected point and return the first point whose found element still matches
+// the recorded one. Returns null when nothing in the band verifies, so the
+// caller fails SAFE with a clear message instead of blind-clicking.
+async function bindingPoint(tab, args, item, pointOverride) {
+  if (!item) return null;
+  const rect = item.rect;
+  const base = pointOverride || (rect && rect.w > 0 && rect.h > 0
+    ? { x: Math.round((rect.x + rect.w / 2) * 10) / 10, y: Math.round((rect.y + rect.h / 2) * 10) / 10 }
+    : null);
+  if (!base) return null;
+  const candidates = [base];
+  for (const dy of [40, 80, 120, -40, -80, -120]) {
+    candidates.push({ x: base.x, y: Math.round((base.y + dy) * 10) / 10 });
+  }
+  for (const p of candidates) {
+    const job = await enqueue('verifyPoint', { tabId: args.tabId, x: p.x, y: p.y });
+    const found = job.result && job.result.found;
+    const verdict = verifyItem(item, found);
+    dbg(`verify ${item.kind}@(${p.x},${p.y}) ->`, verdict.ok ? 'ok' : verdict.reason);
+    if (verdict.ok) return p;
+  }
+  return null;
+}
+
 async function dispatchAction(tab, args) {
   const action = args.action;
   const base = { tabId: args.tabId };
@@ -179,18 +208,22 @@ async function dispatchAction(tab, args) {
       } else if (item.selector && item.rect && item.rect.w > 0 && item.rect.h > 0) {
         await enqueue('scroll', { ...base, selector: item.selector });
         const vp = snapshot.viewport || { w: 1920, h: 1080 };
-        // scrollIntoView({block:'center'}) puts the element's center at the
+        // scrollIntoView({block:'center'}) puts the element's center near the
         // viewport center; horizontal position is invariant under vertical
-        // scroll, so the projected point is (rect center x, vp.h / 2). If the
-        // projection is imprecise (nested scroller, element taller than the
-        // viewport) verifyPoint returns a mismatch and we fail SAFE with an
-        // error instead of blind-clicking the wrong element.
+        // scroll, so the projected point is (rect center x, vp.h / 2). The
+        // projection can be off by a few tens of px (nested scroller, a
+        // same-pattern sibling landing at center), so bindingPoint sweeps a
+        // small vertical band and returns the first point that still verifies;
+        // if none does we fail SAFE instead of blind-clicking the wrong one.
         const projected = {
           x: Math.round((item.rect.x + item.rect.w / 2) * 10) / 10,
           y: Math.round((vp.h / 2) * 10) / 10,
         };
-        await verifyBinding(tab, args, item, projected);
-        job = await enqueue('clickPoint', { ...base, x: projected.x, y: projected.y });
+        const hit = await bindingPoint(tab, args, item, projected);
+        if (!hit) {
+          throw new Error(`Off-screen element ${args.index} did not verify near its projected point after scrolling (${item.kind || item.tag} "${(item.text || '').slice(0, 40)}"); re-read interact before acting.`);
+        }
+        job = await enqueue('clickPoint', { ...base, x: hit.x, y: hit.y });
       } else {
         throw new Error(`Element ${args.index} is off-screen and has no geometry to anchor a click; re-read interact.`);
       }
