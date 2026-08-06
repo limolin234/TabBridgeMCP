@@ -92,6 +92,8 @@ async function enqueue(type, payload) {
     const job = response.jobs.find((item) => item.id === queued.job.id);
     if (!job) continue; // rotated out of the in-memory tail; treat as lost
     lastStatus = job.status;
+    // 'blocked' is a legacy transport value from pre-1.0.3 userscripts; it is
+    // recomputed semantically in compactJob/semanticStatus, never relayed.
     if (['completed', 'blocked', 'error'].includes(job.status)) {
       if (job.status === 'error') throw new Error(job.error || 'Browser action failed');
       return job;
@@ -159,20 +161,20 @@ async function dispatchAction(tab, args) {
       } else {
         throw new Error(`Element ${args.index} is off-screen and has no selector; scroll it into view then re-read.`);
       }
-      // Only completed clicks are remembered (a blocked state or a verify
-      // failure throws before this point) — the "wrong path" guard.
-      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), buildCuesFromItem(item));
+      // Only semantically-completed clicks are remembered (a blocked state or a
+      // verify failure throws before this point) — the "wrong path" guard.
+      if (semanticStatus(job) === 'completed') memory.recordClick(memory.hostnameOf(tab.url), buildCuesFromItem(item));
       return job;
     }
     if (args.point) {
       const job = await enqueue('clickPoint', { ...base, x: args.point.x, y: args.point.y });
-      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: null });
+      if (semanticStatus(job) === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: null });
       return job;
     }
     if (args.x !== undefined && args.y !== undefined) return enqueue('clickPoint', { ...base, x: args.x, y: args.y });
     if (args.selector) {
       const job = await enqueue('click', args);
-      if (job.status === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: args.selector });
+      if (semanticStatus(job) === 'completed') memory.recordClick(memory.hostnameOf(tab.url), { kind: null, text: null, href: null, ariaLabel: null, selector: args.selector });
       return job;
     }
     throw new Error('click requires index, point{x,y}, x/y, or selector');
@@ -212,8 +214,30 @@ async function jobStatus(jobId) {
   return job;
 }
 
+// Semantic wall detection lives here, on the MCP server. The userscript is
+// contractually "collect + report, no judgment" (FROZEN-INTERFACE), so it posts
+// raw facts — attentionRequired + extracted content — and the server decides
+// whether that is a genuine wall. A read is only 'blocked' when the wall left
+// no content behind; a page with a visible sign-in upsell (IEEE "Save Your
+// Search") still has complete content and must report 'completed'.
+function contentEmpty(data) {
+  const values = Object.values(data || {});
+  if (!values.length) return true;
+  return values.every((value) => (Array.isArray(value) ? value.length === 0 : !String(value || '').trim()));
+}
+function semanticStatus(job) {
+  if (job.status === 'error') return 'error';
+  // Non-terminal transport states (queued/claimed) relay as-is; only a finished
+  // job gets the semantic verdict. 'blocked' is a legacy transport value from
+  // pre-1.0.3 userscripts — recompute it too, never relay it verbatim.
+  if (job.status !== 'completed' && job.status !== 'blocked') return job.status;
+  const result = job.result || {};
+  const isWall = !!result.attentionRequired && (job.type !== 'extract' || contentEmpty(result.data));
+  return isWall ? 'blocked' : 'completed';
+}
+
 function compactJob(job, extra = {}) {
-  return { jobId: job.id, status: job.status, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...(job.progress ? { progress: job.progress } : {}), ...extra };
+  return { jobId: job.id, status: semanticStatus(job), ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...(job.progress ? { progress: job.progress } : {}), ...extra };
 }
 
 const tools = [
@@ -383,7 +407,7 @@ process.stdin.on('data', async (chunk) => {
     let message;
     try { message = JSON.parse(line); } catch { continue; }
     if (message.id === undefined) continue;
-    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '1.0.2' } } });
+    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '1.0.3' } } });
     else if (message.method === 'tools/list') send({ jsonrpc: '2.0', id: message.id, result: { tools } });
     else if (message.method === 'tools/call') {
       try { send({ jsonrpc: '2.0', id: message.id, result: content(await callTool(message.params?.name, message.params?.arguments)) }); }

@@ -8,7 +8,7 @@
 
 | 层 | 职责 | 可否改 |
 | --- | --- | --- |
-| `tampermonkey/tampermonkey-browser-mcp.user.js` (v1.0.2) | **采集物理量 + 执行底层动作 + 汇报**,不判断 | 冻结;v1.0.1/1.0.2 起仅允许低层时序/可见性演进 |
+| `tampermonkey/tampermonkey-browser-mcp.user.js` (v1.0.3) | **采集物理量 + 执行底层动作 + 汇报**,不判断(不发 blocked/completed,只报原始 `attentionRequired` + 内容) | 冻结;v1.0.1~1.0.3 起仅允许低层时序/可见性演进 |
 | `bridge.js` | 单实例本地队列,任务源真相(pending 计数) | 最小改动 |
 | `analyzer.js` + `mcp-server.js` + `adapters/` | **全部智能**:交互清单、selector、索引、绑定守卫、优先级 | 自由演进 |
 
@@ -46,4 +46,4 @@
 4. 自适应轮询:完成任务 60ms / 有 pending 150ms / 空闲 1200ms。bridge `/poll` 返回 `pending` 计数。
 5. 未来视觉/截图能力(多模态)落在**本地**,基于油猴已报的 `rect` 坐标作为锚点,不需改油猴。
 6. 已知限制(冻结期内不解决):Shadow DOM 不穿透;纯 CSS `:hover` 菜单不展开;React 受控输入建议用 `clickPoint`+`key` 而非 `fill`。
-7. **例外(v1.0.1/1.0.2)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 只对**可见**的密码/验证码元素报 attention;且 extract 仅在内容为空时才标 `blocked`(有完整内容即使存在登录弹窗也报 `completed`)——修复 IEEE 搜索页 "Sign In to Save Your Search" 弹窗导致的误报 blocked。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。
+7. **例外(v1.0.1~1.0.3)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 只对**可见**的密码/验证码元素报 attention,作为**原始信号**上报。v1.0.3 起 script 不再判定 status(删 `extractEmpty`/`isWall`,`/result` 只发 transport 级 `done`/`error`);语义 blocked/completed 完全移到 MCP server:`semanticStatus()` = `attentionRequired` 且内容为空才 `blocked`(有完整内容即使存在登录弹窗也报 `completed`)——修复 IEEE 搜索页 "Sign In to Save Your Search" 弹窗导致的误报 blocked,后续 status 策略改动只改 server,不重装油猴。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。

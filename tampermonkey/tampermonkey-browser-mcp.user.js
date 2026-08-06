@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      1.0.2
+// @version      1.0.3
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -464,14 +464,6 @@
     }
     throw new Error(`Unsupported action: ${job.type}`);
   }
-  // A read is only genuinely blocked when a wall (captcha/login prompt) left no
-  // content behind. Pages with a visible sign-in upsell (IEEE "Save Your
-  // Search") still return complete content — those must report 'completed'.
-  function extractEmpty(data) {
-    const values = Object.values(data || {});
-    if (!values.length) return true;
-    return values.every((value) => (Array.isArray(value) ? value.length === 0 : !String(value || '').trim()));
-  }
   async function run(job, phase) {
     busy = true;
     paint();
@@ -483,8 +475,11 @@
         return;
       }
       const result = action.result || {};
-      const isWall = result.attentionRequired && (job.type !== 'extract' || extractEmpty(result.data));
-      await api('POST', '/result', { jobId: job.id, clientId, status: isWall ? 'blocked' : 'completed', result });
+      // Transport-level completion only. The userscript collects raw facts and
+      // never judges — the semantic blocked/completed verdict is computed on
+      // the MCP server from result.attentionRequired + result.data
+      // (FROZEN-INTERFACE: 采集 + 执行 + 汇报,不判断).
+      await api('POST', '/result', { jobId: job.id, clientId, status: 'done', result });
       clearActiveJob();
       if (action.downloadTo) navigate(action.downloadTo);
       if (action.clickAfter) click(action.clickAfter);

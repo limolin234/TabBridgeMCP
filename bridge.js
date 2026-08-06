@@ -165,7 +165,10 @@ const server = http.createServer(async (request, response) => {
       const job = state.jobs.find((item) => item.id === body.jobId);
       if (!job) return send(response, 404, { error: 'Unknown job' });
       if (job.clientId !== body.clientId) return send(response, 409, { error: 'Job belongs to another tab' });
-      job.status = body.status === 'blocked' ? 'blocked' : body.status === 'error' ? 'error' : 'completed';
+      // Transport-level completion only. The userscript never posts 'blocked'
+      // anymore — it reports raw attentionRequired + extracted content, and the
+      // semantic blocked/completed verdict is computed on the MCP server.
+      job.status = body.status === 'error' ? 'error' : 'completed';
       job.completedAt = new Date().toISOString();
       job.result = body.result && typeof body.result === 'object' ? body.result : null;
       job.error = typeof body.error === 'string' ? body.error.slice(0, 2000) : null;
