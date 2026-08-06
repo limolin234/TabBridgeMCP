@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      1.0.1
+// @version      1.0.2
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -135,7 +135,14 @@
   }
   const attentionRequired = () => {
     const title = document.title.toLowerCase();
-    return /captcha|verify.*human|sign in|log in/.test(title) || Boolean(document.querySelector('input[type="password"], iframe[src*="captcha"], [class*="captcha"], [id*="captcha"]'));
+    if (/captcha|verify.*human|sign in|log in/.test(title)) return true;
+    // Only a VISIBLE login/captcha element is a real wall. Hidden sign-in
+    // modals (e.g. IEEE "Sign In to Save Your Search") embed password inputs
+    // in collapsed dialogs that are never shown — flagging them made every
+    // IEEE search read report "blocked" even though the content is complete.
+    // `visible` is defined below; this is only invoked at job runtime.
+    const markers = 'input[type="password"], iframe[src*="captcha"], [class*="captcha"], [id*="captcha"]';
+    return [...document.querySelectorAll(markers)].some(visible);
   };
   function pageState() {
     return {
