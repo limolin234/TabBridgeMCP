@@ -7,7 +7,7 @@ const { spawn } = require('node:child_process');
 const adapters = require('./adapters');
 const { interactPlan, analyzeInteract, verifyItem, buildCuesFromItem } = require('./analyzer');
 const memory = require('./memory');
-const { semanticStatus } = require('./status');
+const { semanticStatus, snapshotStale } = require('./status');
 
 // Per-tab interact snapshots: { url, capturedAt, items }. The userscript is
 // frozen; this server-side cache is how we resolve an index to a stable
@@ -17,6 +17,9 @@ const snapshots = new Map();
 const port = Number(process.env.TPMONKEY_MCP_PORT || 18475);
 const defaultTimeoutMs = Number(process.env.TPMONKEY_MCP_TIMEOUT_MS || 30000);
 const tabHeartbeatMs = 60000;
+const snapshotMaxAgeMs = Number(process.env.TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS || 60000);
+const DEBUG = process.env.TABBRIDGE_DEBUG === '1';
+function dbg(...parts) { if (DEBUG) process.stderr.write(`[tabbridge] ${parts.join(' ')}\n`); }
 let bridgeChild = null;
 
 function request(method, pathname, body, timeoutMs = defaultTimeoutMs) {
@@ -119,20 +122,30 @@ function snapshotFor(tabId) {
 }
 function itemFor(tab, args) {
   const snapshot = snapshotFor(args.tabId);
-  if (tab.url !== snapshot.url) throw new Error('Page changed since the interact snapshot; re-read interact.');
+  const fresh = snapshotStale(snapshot, tab.url, snapshotMaxAgeMs);
+  if (!fresh.ok) throw new Error(fresh.reason);
   if (args.index === undefined) throw new Error('index is required');
   const item = snapshot.items[args.index];
   if (!item) throw new Error(`No interact element at index ${args.index} (snapshot has ${snapshot.items.length}). Re-read interact.`);
   return item;
 }
 // Binding guard: before acting, confirm the point still hosts the recorded
-// object. Off-screen targets cannot be verified (elementFromPoint misses them)
-// so they skip the guard and rely on the URL check + selector click.
-async function verifyBinding(tab, args, item) {
-  if (!item || !item.inViewport || !item.point) return true;
-  const job = await enqueue('verifyPoint', { tabId: args.tabId, x: item.point.x, y: item.point.y });
+// object. The point is derived from the snapshot rect center (analyzer.js sets
+// item.point for in-viewport elements) — elementFromPoint is viewport-relative,
+// so off-screen targets cannot be verified directly; the caller passes an
+// override after scrolling them into view. Any mismatch means the page moved
+// between the snapshot and the action, and acting would hit the wrong element.
+async function verifyBinding(tab, args, item, pointOverride) {
+  if (!item) return true;
+  const rect = item.rect;
+  const point = pointOverride || (rect && rect.w > 0 && rect.h > 0
+    ? { x: Math.round((rect.x + rect.w / 2) * 10) / 10, y: Math.round((rect.y + rect.h / 2) * 10) / 10 }
+    : null);
+  if (!point) return true;
+  const job = await enqueue('verifyPoint', { tabId: args.tabId, x: point.x, y: point.y });
   const found = job.result && job.result.found;
   const verdict = verifyItem(item, found);
+  dbg(`verify ${item.kind}@(${point.x},${point.y}) ->`, verdict.ok ? 'ok' : verdict.reason);
   if (!verdict.ok) throw new Error(verdict.reason);
   return true;
 }
@@ -149,18 +162,37 @@ async function dispatchAction(tab, args) {
   if (action === 'click') {
     if (args.index !== undefined) {
       const item = itemFor(tab, args);
-      await verifyBinding(tab, args, item);
-      // Prefer point-click for in-viewport targets: the point is what
-      // verifyPoint validated, so it can never be a wrong identical-class
-      // sibling that a short CSS selector would match. Off-screen targets
-      // have no reliable point, so scroll into view and click by selector.
+      const snapshot = snapshotFor(args.tabId);
+      // Prefer point-click for EVERY index target: the point uniquely pins the
+      // element (two controls can share a selector — topbar logout and a modal
+      // close are both `button.icon-button` — and a selector-click hits the
+      // first DOM match, i.e. the wrong one). verifyPoint confirms the point
+      // still hosts the recorded object before clickPoint acts. In-viewport
+      // targets verify at their own center; off-screen targets have no
+      // elementFromPoint hit, so they scroll into view first and verify at the
+      // projected center (scrollIntoView centers vertically, horizontal is
+      // invariant under vertical scroll).
       let job;
-      if (item.inViewport && item.point) job = await enqueue('clickPoint', { ...base, x: item.point.x, y: item.point.y });
-      else if (item.selector) {
-        if (!item.inViewport) await enqueue('scroll', { ...base, selector: item.selector });
-        job = await enqueue('click', { ...base, selector: item.selector });
+      if (item.inViewport && item.point) {
+        await verifyBinding(tab, args, item);
+        job = await enqueue('clickPoint', { ...base, x: item.point.x, y: item.point.y });
+      } else if (item.selector && item.rect && item.rect.w > 0 && item.rect.h > 0) {
+        await enqueue('scroll', { ...base, selector: item.selector });
+        const vp = snapshot.viewport || { w: 1920, h: 1080 };
+        // scrollIntoView({block:'center'}) puts the element's center at the
+        // viewport center; horizontal position is invariant under vertical
+        // scroll, so the projected point is (rect center x, vp.h / 2). If the
+        // projection is imprecise (nested scroller, element taller than the
+        // viewport) verifyPoint returns a mismatch and we fail SAFE with an
+        // error instead of blind-clicking the wrong element.
+        const projected = {
+          x: Math.round((item.rect.x + item.rect.w / 2) * 10) / 10,
+          y: Math.round((vp.h / 2) * 10) / 10,
+        };
+        await verifyBinding(tab, args, item, projected);
+        job = await enqueue('clickPoint', { ...base, x: projected.x, y: projected.y });
       } else {
-        throw new Error(`Element ${args.index} is off-screen and has no selector; scroll it into view then re-read.`);
+        throw new Error(`Element ${args.index} is off-screen and has no geometry to anchor a click; re-read interact.`);
       }
       // Only semantically-completed clicks are remembered (a blocked state or a
       // verify failure throws before this point) — the "wrong path" guard.
@@ -258,7 +290,16 @@ async function callTool(name, args = {}) {
       plan.fields = plan.fields.filter((f) => f.key === 'interact');
       const job = await enqueue('extract', { tabId: args.tabId, plan: { ...plan, query: { ...options, limit: 120 } } });
       const raw = (job.result && job.result.data && job.result.data.interact) || [];
-      const viewport = { w: 1920, h: 1080 };
+      // The userscript reports the real viewport in pageState (v1.0.4 raw
+      // geometry — FROZEN-INTERFACE). All rects are viewport-relative, so
+      // inViewport/salience/point must use the ACTUAL window size, never a
+      // hardcoded 1920x1080 (wrong on any other display). Fall back only for
+      // older userscripts that predate the report.
+      const reported = job.result && job.result.viewport;
+      const viewport = reported && Number.isFinite(reported.w) && reported.w > 0 && Number.isFinite(reported.h) && reported.h > 0
+        ? { w: Math.round(reported.w), h: Math.round(reported.h) }
+        : { w: 1920, h: 1080 };
+      dbg(`interact viewport ${viewport.w}x${viewport.h}${reported && reported.w ? '' : ' (fallback)'}`);
       const preference = memory.resolvePreference(memory.hostnameOf(tab.url));
       const analyzed = analyzeInteract(raw, { ...options, viewport, preference });
       const capturedAt = new Date().toISOString();
@@ -386,7 +427,7 @@ process.stdin.on('data', async (chunk) => {
     let message;
     try { message = JSON.parse(line); } catch { continue; }
     if (message.id === undefined) continue;
-    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '1.0.3' } } });
+    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: message.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'tabbridge-mcp', version: '1.0.4' } } });
     else if (message.method === 'tools/list') send({ jsonrpc: '2.0', id: message.id, result: { tools } });
     else if (message.method === 'tools/call') {
       try { send({ jsonrpc: '2.0', id: message.id, result: content(await callTool(message.params?.name, message.params?.arguments)) }); }

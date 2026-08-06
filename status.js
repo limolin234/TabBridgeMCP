@@ -14,6 +14,21 @@ function contentEmpty(data) {
   return values.every((value) => (Array.isArray(value) ? value.length === 0 : !String(value || '').trim()));
 }
 
+// Interact-snapshot staleness guard. A click-by-index resolves against the
+// snapshot the MCP server cached at browser_read(interact) time; if the page
+// re-rendered since then the index points at the wrong element. The guard
+// refuses to act on a snapshot that is (a) gone, (b) for a different URL, or
+// (c) older than maxAgeMs, so the caller re-reads instead of misfiring.
+function snapshotStale(snapshot, tabUrl, maxAgeMs) {
+  if (!snapshot) return { ok: false, reason: 'No interact snapshot. Call browser_read with mode "interact" first.' };
+  if (tabUrl !== snapshot.url) return { ok: false, reason: 'Page changed since the interact snapshot; re-read interact.' };
+  const captured = Date.parse(snapshot.capturedAt || '');
+  if (!Number.isFinite(captured)) return { ok: false, reason: 'Interact snapshot has no valid capture time; re-read interact.' };
+  const ageMs = Date.now() - captured;
+  if (ageMs > maxAgeMs) return { ok: false, reason: `Interact snapshot is stale (${Math.round(ageMs / 1000)}s old, max ${Math.round(maxAgeMs / 1000)}s); re-read interact before acting.` };
+  return { ok: true };
+}
+
 // Map a finished bridge job to the semantic status the MCP client sees.
 //   - 'error' relays as-is.
 //   - Non-terminal transport states (queued/claimed) relay as-is.
@@ -29,4 +44,4 @@ function semanticStatus(job) {
   return isWall ? 'blocked' : 'completed';
 }
 
-module.exports = { contentEmpty, semanticStatus };
+module.exports = { contentEmpty, semanticStatus, snapshotStale };

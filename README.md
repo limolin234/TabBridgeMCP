@@ -176,6 +176,14 @@ The project has no runtime dependencies. Run the unit tests with:
 node --test "tests/*.test.js"
 ```
 
+Optional environment variables:
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `TABBRIDGE_DEBUG=1` | Write server-side dispatch and binding-verify logs to stderr | off |
+| `TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS` | Reject an index-based click when the interact snapshot is older than this (ms); re-read interact first | `60000` |
+| `TPMONKEY_MCP_PORT` / `TPMONKEY_MCP_TIMEOUT_MS` | bridge port / default request timeout | `18475` / `30000` |
+
 Test the MCP protocol with:
 
 ```sh

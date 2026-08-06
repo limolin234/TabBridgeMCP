@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      1.0.3
+// @version      1.0.4
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -149,6 +149,11 @@
       url: location.href,
       title: document.title,
       attentionRequired: attentionRequired(),
+      // Raw browser geometry (v1.0.4): the viewport size every rect is relative
+      // to. Server-side inViewport/salience/point need the ACTUAL window size —
+      // a hardcoded fallback is wrong on any other display. Pure collection, no
+      // judgment, so this stays within the frozen contract (FROZEN-INTERFACE).
+      viewport: { w: window.innerWidth, h: window.innerHeight },
     };
   }
   function bounded(value, limit) { return clean(value).slice(0, Math.min(Number(limit) || 1000, 8000)); }

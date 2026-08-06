@@ -752,6 +752,17 @@ function analyzeInteract(raw, options = {}) {
       _chrome: hasChromeAncestor(el.path),
       _hidden: !vis,
     };
+    if (item.inViewport && rect && rect.w > 0 && rect.h > 0) {
+      // Click anchor for binding-verified point-clicks. Two controls can share
+      // one selector (topbar "退出登录" and a modal "关闭" are both
+      // `button.icon-button`), and a selector-click resolves to the FIRST match
+      // in DOM order — the wrong one. A point uniquely pins the element, so
+      // verifyPoint → clickPoint can never hit a same-selector sibling. Only
+      // in-viewport items get a usable point (elementFromPoint misses off-screen
+      // elements); off-screen targets are handled by scroll-then-project in the
+      // server.
+      item.point = { x: Math.round((rect.x + rect.w / 2) * 10) / 10, y: Math.round((rect.y + rect.h / 2) * 10) / 10 };
+    }
     item.score = salience(item, viewport);
     if (options.preference) applyPreference(item, options.preference);
     if (!vis) item.selector = item.selector || selectorFromPath(el.path);
@@ -830,8 +841,17 @@ function analyzeInteract(raw, options = {}) {
     return include ? pick(rest) : rest;
   });
 
-  // expose zones with stable indices aligned to `flat`
-  const indexOf = (item) => flat.findIndex((f) => f.selector === item.selector && f.text === item.text);
+  // expose zones with stable indices aligned to `flat`. Match by the raw
+  // harvest position (rawIndex), never by selector+text findIndex — two
+  // elements that share a selector AND text (virtual-scroll repeats, identical
+  // icon buttons) would otherwise make findIndex report a DIFFERENT flat
+  // position than the item's own slot, so a click-by-index would resolve to
+  // the wrong snapshot element. rawIndex is unique per harvested node, so the
+  // map is exact. (The selector+text fallback only serves synthetic members
+  // such as grouped reps that carry no rawIndex.)
+  const indexByRaw = new Map();
+  flat.forEach((f, i) => { if (f.rawIndex !== undefined && !indexByRaw.has(f.rawIndex)) indexByRaw.set(f.rawIndex, i); });
+  const indexOf = (item) => (item && item.rawIndex !== undefined ? indexByRaw.get(item.rawIndex) : flat.findIndex((f) => f.selector === item.selector && f.text === item.text));
   return {
     zones: {
       primary: zonePick(zones.primary.map((it) => ({ ...pick(it), index: indexOf(it) }))),
@@ -865,6 +885,18 @@ function verifyItem(item, found) {
   const gotHref = found.href;
   if (expectedHref && gotHref && expectedHref !== gotHref) {
     return { ok: false, reason: `element href changed: expected "${expectedHref}" but found "${gotHref}"` };
+  }
+  // Asymmetry guards: a control recorded WITHOUT text/href must not suddenly
+  // carry them at action time. Icon buttons and aria-labelled controls capture
+  // with empty text; if a re-render (or a moved sibling) puts a labeled button
+  // over that point — the classic "close turned into logout" drift — the
+  // empty-text check catches it where the symmetric text check cannot
+  // (expectedText is falsy, so the check above was skipped).
+  if (!expectedText && gotText) {
+    return { ok: false, reason: `element gained text: expected an unlabeled control but found "${found.text.slice(0, 60)}" (page likely re-rendered; re-read interact before acting)` };
+  }
+  if (!expectedHref && gotHref) {
+    return { ok: false, reason: `element gained a link: expected a non-link control but found href "${found.href.slice(0, 80)}" (page likely re-rendered; re-read interact before acting)` };
   }
   return { ok: true };
 }

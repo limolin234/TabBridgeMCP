@@ -8,7 +8,7 @@
 
 | 层 | 职责 | 可否改 |
 | --- | --- | --- |
-| `tampermonkey/tampermonkey-browser-mcp.user.js` (v1.0.3) | **采集物理量 + 执行底层动作 + 汇报**,不判断(不发 blocked/completed,只报原始 `attentionRequired` + 内容) | 冻结;v1.0.1~1.0.3 起仅允许低层时序/可见性演进 |
+| `tampermonkey/tampermonkey-browser-mcp.user.js` (v1.0.4) | **采集物理量 + 执行底层动作 + 汇报**,不判断(不发 blocked/completed,只报原始 `attentionRequired` + 内容) | 冻结;v1.0.1~1.0.4 起仅允许低层时序/可见性/原始几何采集演进 |
 | `bridge.js` | 单实例本地队列,任务源真相(pending 计数) | 最小改动 |
 | `status.js` + `analyzer.js` + `mcp-server.js` + `adapters/` | **全部智能**:status 判定、交互清单、selector、索引、绑定守卫、优先级 | 自由演进 |
 
@@ -17,6 +17,7 @@
 | 属性 | 含义 | 类型 |
 | --- | --- | --- |
 | `rect` | `getBoundingClientRect()` → `{x,y,w,h}` | 浏览器独占几何 |
+| `viewport` (v1.0.4) | `{w: innerWidth, h: innerHeight}`，随 `pageState()` 上报；server 侧 inViewport/salience/point 依赖真实视口，禁止硬编码 1920×1080 | 浏览器独占几何 |
 | `isDisplayed` | computed display/visibility + getClientRects | 浏览器独占可见性 |
 | `disabled` / `checked` / `value` / `type` / `role` | 原始表单/ARIA 状态 | 原始属性 |
 | `path` | 扁平父链 `[{tag,id,class,nth}]` 深度≤8 | 机械采集,无判断 |
@@ -46,4 +47,13 @@
 4. 自适应轮询:完成任务 60ms / 有 pending 150ms / 空闲 1200ms。bridge `/poll` 返回 `pending` 计数。
 5. 未来视觉/截图能力(多模态)落在**本地**,基于油猴已报的 `rect` 坐标作为锚点,不需改油猴。
 6. 已知限制(冻结期内不解决):Shadow DOM 不穿透;纯 CSS `:hover` 菜单不展开;React 受控输入建议用 `clickPoint`+`key` 而非 `fill`。
-7. **例外(v1.0.1~1.0.3)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 只对**可见**的密码/验证码元素报 attention,作为**原始信号**上报。v1.0.3 起 script 不再判定 status(删 `extractEmpty`/`isWall`,`/result` 只发 transport 级 `done`/`error`);语义 blocked/completed 完全移到 MCP server:`semanticStatus()` = `attentionRequired` 且内容为空才 `blocked`(有完整内容即使存在登录弹窗也报 `completed`)——修复 IEEE 搜索页 "Sign In to Save Your Search" 弹窗导致的误报 blocked,后续 status 策略改动只改 server,不重装油猴。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。
+7. **例外(v1.0.1~1.0.3)**: ① `waitForReady` 就绪等待 —— 有 selector 时轮询 `querySelector` 命中,否则等 `document.readyState === 'complete'`;`force:true` 跳过。② `attentionRequired` 只对**可见**的密码/验证码元素报 attention,作为**原始信号**上报。v1.0.3 起 script 不再判定 status(删 `extractEmpty`/`isWall`,`/result` 只发 transport 级 `done`/`error`);语义 blocked/completed 完全移到 MCP server:`semanticStatus()` = `attentionRequired` 且内容为空才 `blocked`(有完整内容即使存在登录弹窗也报 `completed`)——修复 IEEE 搜索页 "Sign In to Save Your Search" 弹窗导致的误报 blocked,后续 status 策略改动只改 server,不重装油猴。都是时序/可见性采集,不涉及交互对象分析/selector 合成/优先级,是唯一允许的油猴演进。8. **例外(v1.0.4)**: `pageState()` 上报原始视口几何 `{w: innerWidth, h: innerHeight}`(纯采集,不判断)。server 侧 inViewport/salience/point 全部依赖真实视口——此前硬编码 1920×1080,在任何其他分辨率上都是错的。也属于原始几何采集,是允许的演进。
+
+## Server 侧交互安全守卫(v1.0.4,均在自由演进层)
+
+油猴只负责"采集 + 执行 + 汇报",交互安全由本地 server 保障。点击按 `index` 解析快照元素后,一律走**绑定校验**:`verifyPoint` 确认该点仍是录制时的元素,`verifyItem` 比对 tag/text/href 并新增**不对称校验**(录制时无文本/无链接的元素不得在动作时获得文本/链接——"关闭"被重渲染成"退出登录"正是这种形态)。失败即报错,绝不盲点。
+
+- **快照新鲜度**: `snapshotStale()` 拒绝 URL 已变化或超过 `TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS`(默认 60s)的快照,强制先 `browser_read(interact)` 再动作。
+- **索引对齐**: zone 索引按原始收割位置(`rawIndex`)对齐 flat 列表,不再用 selector+text 反推——两个同 selector 同 text 的元素(顶栏"退出登录"与弹窗"关闭"都是 `button.icon-button`)此前会映射到同一索引。
+- **点击锚点**: in-viewport 元素携带 `point`(rect 中心),点击走 `verifyPoint → clickPoint`,从根上消除同 selector 歧义;离屏元素先 `scrollIntoView` 再在投影中心校验后点击。
+- **可观测性**: `TABBRIDGE_DEBUG=1` 输出 server 侧调度与校验日志。

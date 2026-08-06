@@ -157,6 +157,14 @@ userscript 会使用当前页面的登录态请求文件，转成 Blob，再触�
 node --test "tests/*.test.js"
 ```
 
+可选环境变量：
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `TABBRIDGE_DEBUG=1` | 输出 server 侧调度与交互校验日志到 stderr | 关闭 |
+| `TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS` | interact 快照超过该毫秒数即拒绝点击并提示重新读取 | `60000` |
+| `TPMONKEY_MCP_PORT` / `TPMONKEY_MCP_TIMEOUT_MS` | bridge 端口 / 默认请求超时 | `18475` / `30000` |
+
 用以下命令测试 MCP 协议和工具列表：
 
 ```sh

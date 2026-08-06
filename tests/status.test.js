@@ -9,7 +9,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { contentEmpty, semanticStatus } = require('../status');
+const { contentEmpty, semanticStatus, snapshotStale } = require('../status');
 
 test('full content behind a visible upsell modal → completed (IEEE search)', () => {
   assert.strictEqual(semanticStatus({
@@ -80,4 +80,41 @@ test('contentEmpty handles arrays and missing data', () => {
   assert.strictEqual(contentEmpty({ links: ['a'] }), false);
   assert.strictEqual(contentEmpty({ text: '   ' }), true);
   assert.strictEqual(contentEmpty({ text: ' x ' }), false);
+});
+
+// ---- snapshotStale: interact-snapshot freshness guard -----------------------
+
+function isoAgo(seconds) { return new Date(Date.now() - seconds * 1000).toISOString(); }
+const freshSnapshot = (overrides = {}) => ({
+  url: 'https://example.com/', capturedAt: isoAgo(1), items: [],
+  ...overrides,
+});
+
+test('snapshotStale: fresh snapshot with matching URL passes', () => {
+  assert.deepStrictEqual(snapshotStale(freshSnapshot(), 'https://example.com/', 60000), { ok: true });
+});
+
+test('snapshotStale: no snapshot → reject with re-read hint', () => {
+  const r = snapshotStale(null, 'https://example.com/', 60000);
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reason, /interact/i);
+});
+
+test('snapshotStale: URL changed since capture → reject (page navigated)', () => {
+  const r = snapshotStale(freshSnapshot(), 'https://other.example.com/', 60000);
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reason, /Page changed/i);
+});
+
+test('snapshotStale: snapshot older than maxAge → reject with age in the message', () => {
+  const r = snapshotStale(freshSnapshot({ capturedAt: isoAgo(120) }), 'https://example.com/', 60000);
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reason, /stale/i);
+  assert.match(r.reason, /120/);
+});
+
+test('snapshotStale: unparseable capture time → reject (defensive)', () => {
+  const r = snapshotStale(freshSnapshot({ capturedAt: 'not-a-date' }), 'https://example.com/', 60000);
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reason, /capture time/i);
 });
