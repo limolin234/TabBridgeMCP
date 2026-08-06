@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `tampermonkey/tampermonkey-browser-mcp.user.js` (v1.0.3) | **采集物理量 + 执行底层动作 + 汇报**,不判断(不发 blocked/completed,只报原始 `attentionRequired` + 内容) | 冻结;v1.0.1~1.0.3 起仅允许低层时序/可见性演进 |
 | `bridge.js` | 单实例本地队列,任务源真相(pending 计数) | 最小改动 |
-| `analyzer.js` + `mcp-server.js` + `adapters/` | **全部智能**:交互清单、selector、索引、绑定守卫、优先级 | 自由演进 |
+| `status.js` + `analyzer.js` + `mcp-server.js` + `adapters/` | **全部智能**:status 判定、交互清单、selector、索引、绑定守卫、优先级 | 自由演进 |
 
 ## 油猴采集的物理量(property 虚拟属性)
 

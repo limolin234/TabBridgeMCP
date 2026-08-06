@@ -7,6 +7,7 @@ const { spawn } = require('node:child_process');
 const adapters = require('./adapters');
 const { interactPlan, analyzeInteract, verifyItem, buildCuesFromItem } = require('./analyzer');
 const memory = require('./memory');
+const { semanticStatus } = require('./status');
 
 // Per-tab interact snapshots: { url, capturedAt, items }. The userscript is
 // frozen; this server-side cache is how we resolve an index to a stable
@@ -212,28 +213,6 @@ async function jobStatus(jobId) {
   const job = response.jobs.find((item) => item.id === jobId);
   if (!job) throw new Error('Unknown jobId');
   return job;
-}
-
-// Semantic wall detection lives here, on the MCP server. The userscript is
-// contractually "collect + report, no judgment" (FROZEN-INTERFACE), so it posts
-// raw facts — attentionRequired + extracted content — and the server decides
-// whether that is a genuine wall. A read is only 'blocked' when the wall left
-// no content behind; a page with a visible sign-in upsell (IEEE "Save Your
-// Search") still has complete content and must report 'completed'.
-function contentEmpty(data) {
-  const values = Object.values(data || {});
-  if (!values.length) return true;
-  return values.every((value) => (Array.isArray(value) ? value.length === 0 : !String(value || '').trim()));
-}
-function semanticStatus(job) {
-  if (job.status === 'error') return 'error';
-  // Non-terminal transport states (queued/claimed) relay as-is; only a finished
-  // job gets the semantic verdict. 'blocked' is a legacy transport value from
-  // pre-1.0.3 userscripts — recompute it too, never relay it verbatim.
-  if (job.status !== 'completed' && job.status !== 'blocked') return job.status;
-  const result = job.result || {};
-  const isWall = !!result.attentionRequired && (job.type !== 'extract' || contentEmpty(result.data));
-  return isWall ? 'blocked' : 'completed';
 }
 
 function compactJob(job, extra = {}) {
