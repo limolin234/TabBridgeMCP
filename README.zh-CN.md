@@ -96,6 +96,8 @@ git pull --ff-only
 {"tabId":"TAB_ID","mode":"links","contains":"PDF","visible":true,"limit":10}
 ```
 
+读取前默认会等页面就绪：SPA（如 IEEE Xplore 搜索）在导航后异步渲染内容，过早读取只会看到空壳。传入内容 selector（如 IEEE 上 `a[href*='/document/']`）会等到该内容出现，不传则等 document 加载完成；`force:true` 立即读取当前视图。
+
 支持的 `mode` 有：
 
 - `summary`：标题、正文、标题列表、链接和控件；

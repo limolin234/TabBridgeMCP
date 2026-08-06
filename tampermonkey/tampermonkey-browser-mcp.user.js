@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TabBridge MCP Browser Bridge
 // @namespace    local.tampermonkey-browser-mcp
-// @version      1.0.0
+// @version      1.0.1
 // @description  Cross-platform local MCP executor for explicitly enabled ordinary browser tabs.
 // @match        http://*/*
 // @match        https://*/*
@@ -103,6 +103,36 @@
   const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
   const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
   const validSelector = (value) => typeof value === 'string' && value.length > 0 && value.length <= 500;
+  // Wait for async-rendered content before extracting (v1.0.1). SPA pages
+  // (IEEE Xplore search, Angular apps) fill their DOM AFTER navigate; a read
+  // issued too early returns an empty shell even though the page looks loaded.
+  // Default waits for the page to be ready: with a caller-supplied content
+  // selector, poll until it matches; otherwise wait for the document load.
+  // force:true skips the wait and returns the current view immediately.
+  // Bounded by waitMs; never throws on timeout — the extract then sees whatever
+  // is actually there. Low-level timing only, no judgment.
+  function waitForReady(plan) {
+    const query = (plan && plan.query) || {};
+    if (query.force === true) return Promise.resolve();
+    const maxMs = Math.min(Math.max(Number(query.waitMs) || 10000, 250), 25000);
+    const selector = validSelector(query.selector) ? query.selector : null;
+    if (!selector && document.readyState === 'complete') return Promise.resolve();
+    const deadline = Date.now() + maxMs;
+    return new Promise((resolve) => {
+      let timer = null;
+      const done = () => { if (timer) clearTimeout(timer); resolve(); };
+      const check = () => {
+        if (Date.now() >= deadline) return done();
+        if (selector) {
+          try { if (document.querySelector(selector)) return done(); } catch { return done(); }
+        } else if (document.readyState === 'complete') {
+          return done();
+        }
+        timer = setTimeout(check, 200);
+      };
+      check();
+    });
+  }
   const attentionRequired = () => {
     const title = document.title.toLowerCase();
     return /captcha|verify.*human|sign in|log in/.test(title) || Boolean(document.querySelector('input[type="password"], iframe[src*="captcha"], [class*="captcha"], [id*="captcha"]'));
@@ -336,7 +366,7 @@
       await wait(500);
       return { result: pageState() };
     }
-    if (job.type === 'extract') return { result: extract(payload.plan) };
+    if (job.type === 'extract') { await waitForReady(payload.plan); return { result: extract(payload.plan) }; }
     if (job.type === 'inspect') return { result: inspect(payload.mode, payload.limit) };
     if (job.type === 'fill') { fill(payload.selector, String(payload.value ?? '')); return { result: pageState() }; }
     if (job.type === 'click') {

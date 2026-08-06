@@ -124,6 +124,12 @@ fields) and returns structured data. It does not send raw page HTML or a full
 page dump by default; `browser_inspect` remains the bounded fallback when the
 cleaned views are insufficient.
 
+`browser_read` waits for the page to be ready before extracting: SPA pages
+(e.g. IEEE Xplore search) render content asynchronously after navigation, so a
+read issued too early would see an empty shell. Pass a content selector (e.g.
+`a[href*='/document/']` on IEEE) to wait until that content appears, or omit it
+to wait for the document load; `force: true` reads the current view immediately.
+
 Typical reads use one tool with different levels rather than many specialized
 tools:
 
