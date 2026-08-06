@@ -60,13 +60,51 @@ function interactPlan(options = {}) {
   };
 }
 
-const KIND_RANK = { button: 0, input: 0, select: 0, textarea: 0, link: 1, clickable: 2 };
-const KIND_WEIGHT = { input: 0.9, textarea: 0.85, select: 0.8, button: 0.7, link: 0.5, clickable: 0.35 };
+const KIND_RANK = { button: 0, input: 0, select: 0, textarea: 0, close: 0, link: 1, clickable: 2 };
+const KIND_WEIGHT = { input: 0.9, textarea: 0.85, select: 0.8, button: 0.7, link: 0.5, close: 0.4, clickable: 0.35 };
 function kindOf(el) {
   const t = el.tag;
   if (['input', 'select', 'textarea', 'button'].includes(t)) return t;
   if (t === 'a' && el.href) return 'link';
   return el.role || 'clickable';
+}
+
+// ---- Close / return affordances --------------------------------------------
+// "关闭 = 返回": anything that opens a surface can be dismissed to get back to
+// where you were, so the close/return control is a first-class page element —
+// NOT modal chrome to delete. The AI may need to dismiss a dialog or step
+// back, so close controls get kind 'close' and stay findable instead of being
+// discarded as noise. Only consent/cookie machinery stays hidden: the AI must
+// never interact with it.
+const CLOSE_GLYPH_RE = /^[×x✕✖✗]$/i;
+const CLOSE_TEXT_RE = /^(?:close|dismiss|关闭|返回|back|goback|退出)$/i;
+const CLOSE_ARIA_RE = /^(?:close|dismiss)\b|^关闭|^返回/i;
+const CLOSE_CLASS_RE = /\b(close|dismiss|closer)\b/i;
+// Consent machinery tokens. Matched against the element AND every path
+// ancestor, so a close button inside a cookie banner is machinery too.
+const CONSENT_TOKEN_RE = /\b(cookie|consent|gdpr|onetrust|osano|didomi|qc-cmp|sp_message|cybot|cookiebot)\b/i;
+function consentSurface(el) {
+  if (!el) return false;
+  const own = `${String(el.id || '')} ${(Array.isArray(el.path) && el.path[0] && Array.isArray(el.path[0].class) ? el.path[0].class.join(' ') : '')}`;
+  if (CONSENT_TOKEN_RE.test(own)) return true;
+  if (!Array.isArray(el.path)) return false;
+  for (const part of el.path) {
+    const id = part && part.id ? String(part.id) : '';
+    const cls = part && Array.isArray(part.class) ? part.class.join(' ') : '';
+    if (CONSENT_TOKEN_RE.test(`${id} ${cls}`)) return true;
+  }
+  return false;
+}
+// Recognize a close/return control from static cues (text glyph, aria-label,
+// class/id). Form controls can never be a close affordance.
+function closeKind(el) {
+  if (!el || ['input', 'select', 'textarea'].includes(el.tag)) return null;
+  const text = String(el.text || '').trim();
+  const aria = String(el.ariaLabel || '').trim();
+  const cls = (Array.isArray(el.path) && el.path[0] && Array.isArray(el.path[0].class) ? el.path[0].class : []).join(' ');
+  const id = String(el.id || '');
+  if (!CLOSE_TEXT_RE.test(text) && !CLOSE_GLYPH_RE.test(text) && !CLOSE_ARIA_RE.test(aria) && !CLOSE_CLASS_RE.test(cls) && !CLOSE_CLASS_RE.test(id)) return null;
+  return 'close';
 }
 
 function inViewport(rect, viewport) {
@@ -134,10 +172,13 @@ function isSpecial(el) {
 }
 
 // ---- Noise detection ------------------------------------------------------
-// Consent/cookie overlays, modal close buttons, and accessibility widgets are
-// NOT what a user is looking at — promoting them to primary wastes the AI's
-// attention and forces extra queries to reach the real content. Detect them
-// from static facts (id/class/aria/role/text) and demote to hidden.
+// Consent/cookie overlays and accessibility widgets are NOT what a user is
+// looking at — promoting them to primary wastes the AI's attention and forces
+// extra queries to reach the real content. Detect them from static facts
+// (id/class/aria/role/text) and demote to hidden. Modal/dialog CLOSE controls
+// are deliberately NOT noise: they are the "return" affordance of a surface
+// (关闭 = 返回) and must stay findable so the AI can dismiss a dialog or step
+// back. Only consent machinery stays hidden.
 
 const NOISE_SELECTOR = [
   'CybotCookiebotDialog',       // Cookiebot — trademark token, no word boundary
@@ -154,11 +195,15 @@ const NOISE_SELECTOR = [
   'ot-sdk',                    // OneTrust SDK containers
 ].join('|');
 const NOISE_TOKEN_RE = new RegExp(NOISE_SELECTOR, 'i');
-const NOISE_WORD_RE = new RegExp(`(^|[^a-z])(cookie|consent|gdpr|modal|dialog|popover|close-modal|bp-modal|visually-hidden|sr-only|skip-link|cookie-banner)([^a-z]|$)`, 'i');
-// Banner copy. Phrases, not single words: "consent" alone stays in NOISE_WORD_RE
-// (id/class context) but a page may legitimately say "consent" in body text.
+// Surface-chrome tokens in an element's OWN id/class (modal-close, dialog-title).
+// They are noise for ordinary elements but a close/return control keeps through.
+const SURFACE_WORD_RE = /\b(modal|dialog|popover|close-modal|bp-modal)\b/i;
+// Accessibility-only widget markers.
+const A11Y_WORD_RE = /\b(visually-hidden|sr-only|skip-link)\b/i;
+// Banner copy. Phrases, not single words: "consent" alone stays in CONSENT
+// tokens (id/class context) but a page may legitimately say "consent" in body
+// text.
 const NOISE_TEXT_RE = /(allow all cookies|accept all cookies|accept all|use necessary cookies|essential cookies|reject all|reject non-essential|manage consent|cookie settings|consent preferences|cookie preferences|privacy settings|privacy choice|your privacy, your choice|your privacy choices|we value your privacy|我们使用.*?cookie|为了改善您的体验|接受所有.*?cookie|全部接受|拒绝全部|同意并继续|同意并进入|我知道了|仅必要)/i;
-const NOISE_CLOSE_RE = /^[×x✕✖]|close( modal| dialog| menu)?$/i;
 
 // Clean extracted control text: some sites leak code-looking fragments into
 // control labels (Google renders a hidden element whose text is the CSS rule
@@ -211,13 +256,24 @@ function isNoise(item) {
   const role = String(item.role || '').toLowerCase();
   const text = String(item.text || '');
   const aria = String(item.ariaLabel || '');
-  // 1. consent/cookie banner controls by id/class/role/text
-  if (NOISE_TOKEN_RE.test(id) || NOISE_TOKEN_RE.test(cls) || NOISE_WORD_RE.test(id) || NOISE_WORD_RE.test(cls) || NOISE_TEXT_RE.test(text) || NOISE_TEXT_RE.test(aria)) return true;
+  const isClose = item.kind === 'close';
+  // 1. Consent/cookie machinery is ALWAYS noise — including a close control
+  //    inside it (a cookie banner's ×). The AI must never interact with it.
+  if (NOISE_TOKEN_RE.test(id) || NOISE_TOKEN_RE.test(cls)) return true;
+  if (consentSurface(item)) return true;
+  if (NOISE_TEXT_RE.test(text) || NOISE_TEXT_RE.test(aria)) return true;
+  // 2. The dialog/modal shell itself (role=dialog) is a container, not an
+  //    action — but the close/return control OF that surface stays findable.
   if (role === 'dialog' || role === 'alertdialog') return true;
-  // 2. modal chrome: close buttons / hidden labels
-  if (NOISE_CLOSE_RE.test(text) && item.kind !== 'link') return true;
-  if (/^close/i.test(aria) && /modal|dialog|popup/i.test(aria)) return true;
-  // 3. accessibility-only widgets
+  // 3. Surface-chrome tokens in own id/class (modal-close, dialog-title) are
+  //    noise UNLESS the element is the close/return control of that surface —
+  //    that one keeps through as kind 'close' ("关闭 = 返回").
+  if (SURFACE_WORD_RE.test(id) || SURFACE_WORD_RE.test(cls)) {
+    if (isClose) return false;
+    return true;
+  }
+  // 4. accessibility-only widgets
+  if (A11Y_WORD_RE.test(id) || A11Y_WORD_RE.test(cls)) return true;
   if (/skip to (main )?content|跳转到主要/i.test(text) || /^main navigation/i.test(aria)) return true;
   return false;
 }
@@ -244,7 +300,10 @@ function salience(item, viewport) {
   // worth far more than a large-but-mute icon or a checkbox whose text is "on".
   const text = String(item.text || '').trim();
   const label = String(item.ariaLabel || '').trim();
-  const meaningful = (text && !/^(on|off|true|false|×|x)$/i.test(text) && text.length >= 2) || (label && label.length >= 4);
+  // A bare close glyph (×) is meaningful for a close/return control — that
+  // labelless button is exactly the dismiss affordance the AI may need.
+  const bareCloseGlyph = item.kind === 'close' && /^[×x✕✖✗]$/i.test(text);
+  const meaningful = (text && !/^(on|off|true|false)$/i.test(text) && (text.length >= 2 || bareCloseGlyph)) || (label && label.length >= 4);
   const textness = meaningful ? Math.min(0.08 * Math.log1p(Math.max(text.length, label.length)), 1) : 0;
   let score = 100 * (0.22 * size + 0.18 * position + 0.18 * kind + 0.14 * special + 0.28 * textness);
   if (!item.inViewport) score = Math.min(score, 5); // off-screen never primary
@@ -654,11 +713,13 @@ function analyzeInteract(raw, options = {}) {
   const offset = Math.max(Number(options.offset) || 0, 0);
 
   const all = (raw || []).map((el, i) => {
-    const kind = kindOf(el);
     const rect = el.rect;
     const vis = rect && rect.w > 0 && rect.h > 0 && el.isDisplayed !== false;
     const rawText = el.text || '';
     const text = cleanText(rawText);
+    // A close/return control is a first-class kind ("关闭 = 返回"), recognized
+    // from static cues before the generic tag/role kind.
+    const kind = closeKind({ ...el, text, ariaLabel: el['aria-label'] }) || kindOf(el);
     // Raw text that cleans to nothing (a lone CSS rule, a stray script remnant)
     // means the control carries only code noise — hide it outright.
     const textWasAllNoise = text === '' && rawText.trim() !== '';
@@ -808,4 +869,4 @@ function verifyItem(item, found) {
   return { ok: true };
 }
 
-module.exports = { interactPlan, analyzeInteract, verifyItem, selectorFromPath, isSpecial, groupKeyFor, buildCuesFromItem, markMatchScore, clickBoost, applyPreference, buildKey, INTERACT_SELECTOR, STRUCTURE_SELECTOR };
+module.exports = { interactPlan, analyzeInteract, verifyItem, selectorFromPath, isSpecial, salience, groupKeyFor, buildCuesFromItem, markMatchScore, clickBoost, applyPreference, buildKey, INTERACT_SELECTOR, STRUCTURE_SELECTOR };
