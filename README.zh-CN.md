@@ -163,6 +163,7 @@ node --test "tests/*.test.js"
 | --- | --- | --- |
 | `TABBRIDGE_DEBUG=1` | 输出 server 侧调度与交互校验日志到 stderr | 关闭 |
 | `TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS` | interact 快照超过该毫秒数即拒绝点击并提示重新读取 | `60000` |
+| `TPMONKEY_MCP_TAB_HEARTBEAT_MS` | 标签页最后一次 poll 超过该毫秒数即从 `browser_tabs` 移除。浏览器会把后台/隐藏标签的定时器节流到约 1 次/分钟,该值须远大于 poll 节奏,否则活动标签会时有时无(显示为空) | `300000` |
 | `TPMONKEY_MCP_PORT` / `TPMONKEY_MCP_TIMEOUT_MS` | bridge 端口 / 默认请求超时 | `18475` / `30000` |
 
 用以下命令测试 MCP 协议和工具列表：

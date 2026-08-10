@@ -182,6 +182,7 @@ Optional environment variables:
 | --- | --- | --- |
 | `TABBRIDGE_DEBUG=1` | Write server-side dispatch and binding-verify logs to stderr | off |
 | `TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS` | Reject an index-based click when the interact snapshot is older than this (ms); re-read interact first | `60000` |
+| `TPMONKEY_MCP_TAB_HEARTBEAT_MS` | Drop a tab from `browser_tabs` when its last poll is older than this (ms). Browsers throttle hidden-tab timers to ~1/min, so keep this far above the poll cadence or live tabs intermittently disappear | `300000` |
 | `TPMONKEY_MCP_PORT` / `TPMONKEY_MCP_TIMEOUT_MS` | bridge port / default request timeout | `18475` / `30000` |
 
 Test the MCP protocol with:

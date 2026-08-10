@@ -16,7 +16,14 @@ const snapshots = new Map();
 
 const port = Number(process.env.TPMONKEY_MCP_PORT || 18475);
 const defaultTimeoutMs = Number(process.env.TPMONKEY_MCP_TIMEOUT_MS || 30000);
-const tabHeartbeatMs = 60000;
+// A tab is dropped from browser_tabs when its last /poll is older than this.
+// Browsers throttle hidden-tab timer chains hard (Chrome: ~1 poll/minute), so
+// a 60s cutoff aliased with the throttled cadence and browser_tabs returned
+// EMPTY for live tabs; the next action enqueued a job, the tab's throttled
+// poll refreshed lastSeenAt, and the tab reappeared. 5 min sits far above the
+// worst-case throttled cadence; a truly closed tab lingers at most this long
+// before actions report Unknown tabId.
+const tabHeartbeatMs = Number(process.env.TPMONKEY_MCP_TAB_HEARTBEAT_MS || 300000);
 const snapshotMaxAgeMs = Number(process.env.TPMONKEY_MCP_SNAPSHOT_MAX_AGE_MS || 60000);
 const DEBUG = process.env.TABBRIDGE_DEBUG === '1';
 function dbg(...parts) { if (DEBUG) process.stderr.write(`[tabbridge] ${parts.join(' ')}\n`); }
