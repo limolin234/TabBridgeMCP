@@ -114,6 +114,15 @@ The public MCP surface includes `browser_tabs`, `browser_read`,
 | `browser_job_status` | Read the status and byte progress of a background browser job. |
 | `browser_inspect` | Return bounded text or HTML when cleaned reads are insufficient. |
 
+### Search guidance
+
+For a site search, first look for a usable search URL and call `browser_action`
+with `navigate`, putting the query in the URL path or query string (for example,
+`https://example.com/search?q=term`). This avoids fragile input targeting,
+form filling, and an extra submit action, and is supported by most sites. Fall
+back to `fill` plus click/keypress only when the site has no usable GET search
+URL or explicitly requires a POST/interactive search.
+
 `browser_read` selects a server-side adapter from the page URL and sends a
 declarative DOM extraction plan to the browser. Its `mode` can be `summary`,
 `text`, `elements`, `links`, `controls`, or `media`; `selector`, `contains`,

@@ -87,6 +87,14 @@ git pull --ff-only
 | `browser_job_status` | 查询后台浏览器任务状态和下载字节进度。 |
 | `browser_inspect` | 清洗结果不足时，返回有限的文本或 HTML 调试信息。 |
 
+### 搜索建议
+
+需要在网站搜索时，优先识别该站点的搜索 URL，并用 `browser_action` 的
+`navigate` 直接打开带查询参数或路径的地址，例如
+`https://example.com/search?q=关键词`。这样不需要定位输入框、填写文本和再提交，
+也能减少页面重排带来的注意力和时序问题。只有站点没有可用的 GET 搜索地址，或明确
+要求 POST/交互式搜索时，才使用 `fill` 后再点击或按键提交。
+
 `browser_read` 通过一个工具提供多个层次，不额外增加大量专用工具：
 
 ```json
